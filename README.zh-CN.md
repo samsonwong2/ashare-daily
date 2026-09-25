@@ -89,6 +89,10 @@ ashare-daily triggers \
   --next-day 2026-09-25
 ```
 
+## 示例页面
+
+[examples/查看HTML.md](examples/查看HTML.md) 说明怎么打开比亚迪上市以来的示例页 `examples/regime_transition_SZ002594_比亚迪_20110630_20260924_adaptive.html`。
+
 ## 测试
 
 ```bash

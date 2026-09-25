@@ -81,6 +81,10 @@ Same dendrogram with a coarser distance cut of `0.8`. The page is `$TEMP_DIR/hrp
 
 Scans the from-listing HTML and writes next-session trigger prices back into that same directory: `next_day_triggers_{next-day}.md`, `.csv`, and `_hard_touch.csv`. The anchor is `SH000300`. `YYYYMMDD` in the line above is a placeholder. For the 2026-09-24 batch, replace it with `20260924`. If the shell did not expand `$PLOTLY_ROOT`, the command still looks up that directory name under `PLOTLY_ROOT` from `config.env`. When `--as-of` and `--next-day` are omitted, the date in the directory name is T, and T+1 is the next weekday. `20260924_from_listing_stock` becomes `--as-of 2026-09-24 --next-day 2026-09-25`. This skip does not know exchange holidays. Pass `--next-day` yourself when the next session is not the next weekday.
 
+## Example page
+
+[examples/查看HTML.md](examples/查看HTML.md) explains how to open the BYD from-listing sample, `examples/regime_transition_SZ002594_比亚迪_20110630_20260924_adaptive.html`.
+
 ## Tests
 
 ```bash

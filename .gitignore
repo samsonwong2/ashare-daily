@@ -3,6 +3,7 @@ configs/production_regime_switch_ewma_shrink.json
 configs/shared_filter_config.json
 runtime/
 *.html
+!examples/regime_transition_SZ002594_比亚迪_20110630_20260924_adaptive.html
 __pycache__/
 *.pyc
 .pytest_cache/
