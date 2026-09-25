@@ -8,9 +8,13 @@
 
 ## 打开
 
-用 Chrome、Edge 或 Firefox 打开这个文件。页面上的图由 Plotly 3.1.1 绘制，脚本从 `https://cdn.plot.ly/plotly-3.1.1.min.js` 加载。打开时电脑要能访问这个地址，否则页面是空白的。
+在线看图用这个地址，用 Chrome、Edge 或 Firefox 打开：
 
-GitHub 仓库页面不执行这张图。在仓库里下载该文件，再用浏览器打开本地副本。
+https://samsonwong2.github.io/ashare-daily/examples/regime_transition_SZ002594_%E6%AF%94%E4%BA%9A%E8%BF%AA_20110630_20260924_adaptive.html
+
+仓库文件页只提供下载，不会把这张图画出来。文件大约 34MB，超过 GitHub 在文件页里直接展示的大小。上面这个地址由 GitHub Pages 把同一份 HTML 当作网页发出去，浏览器才会执行它。
+
+页面上的图由 Plotly 3.1.1 绘制，脚本从 `https://cdn.plot.ly/plotly-3.1.1.min.js` 加载。打开时电脑要能访问这个地址，否则页面是空白的。也可以把仓库里的文件下载到本机，再用浏览器打开本地副本。
 
 第一次载入要等几秒。图出现后再往下滚动。
 
