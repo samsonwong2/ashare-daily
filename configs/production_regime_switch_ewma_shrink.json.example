@@ -1,0 +1,18 @@
+{
+  "description": "Copy to production_regime_switch_ewma_shrink.json and fill in this machine. Do not commit the filled file.",
+  "paths": {
+    "provider_uri": "~/.qlib/qlib_data/cn_data",
+    "qlib_scripts_dir": "",
+    "temp_dir": "~/ashare-daily-output",
+    "workspace_dir": "{project_root}/workspace",
+    "log_dir": "{workspace_dir}/logs",
+    "local_library_dir": "",
+    "fund_list_csv": "{temp_dir}/stock_list.csv",
+    "qlib_change_csv_dir": "{provider_uri}/change_csv",
+    "all_instruments_txt": "{provider_uri}/instruments/all.txt",
+    "cluster_mapping_path": "{provider_uri}/instruments/cluster_mapping_selected.txt",
+    "etf_risk_report_script": "",
+    "etf_risk_pack_dir": "",
+    "etf_risk_source_pack_dir": ""
+  }
+}

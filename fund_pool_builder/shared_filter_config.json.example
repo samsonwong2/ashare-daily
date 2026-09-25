@@ -1,0 +1,10 @@
+{
+  "provider_uri": "~/.qlib/qlib_data/cn_data/",
+  "market": "csi1800",
+  "universe_type": "stock",
+  "universe_file": "~/.qlib/qlib_data/cn_data/instruments/csi1800.txt",
+  "max_universe_size": 7000,
+  "test_period": ["2025-06-30", "2026-06-30"],
+  "stock_list_csv": "~/ashare-daily-output/stock_list.csv",
+  "fund_list_csv": "~/ashare-daily-output/stock_list.csv"
+}

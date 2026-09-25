@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+config.env
+configs/production_regime_switch_ewma_shrink.json
+fund_pool_builder/shared_filter_config.json
+workspace/plotly_outputs/
+workspace/decision_packs/
+workspace/logs/
+*.html
