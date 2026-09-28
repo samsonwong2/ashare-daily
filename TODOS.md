@@ -37,3 +37,21 @@ Deferred on 2026-09-25 during the src-layout review. None of these block the mov
 - **Cons:** 改配置会改变每天的池子。审计没出数之前改，测量对象和生产同时变。
 - **Context:** 2026-09-28 eng review D1/D16/D21。审计器故意不改这条配置。summary JSON 里的 Jaccard 是差距的证据。从 `shared_filter_config.json` 的 `test_period[0]` 改起，不要改 `prepare_recent_window`。
 - **Depends on:** `recall_audit` 全量跑完，并且 summary 里已经有和生产池的 Jaccard。
+
+## 召回率的 h 与 N 敏感性（不改判定带）
+
+- **What:** 在第一份 `status: ok` 的 summary 之后，另跑 h∈{5,10,20}、赢家人数∈{20,50}，只比较结论的排序是否和 h=10、N=50 一样。不把扫描结果写进判定带。
+- **Why:** 判定带已经锁在 h=10、前 50 名。若换一个持有期或赢家人数，档位会翻，这份 JSON 就不能单独指导要不要加目标只数。
+- **Pros:** 用同一套审计器回答「结论稳不稳」，不必新写选股器。
+- **Cons:** 每多一档就要再聚类一轮，墙钟时间大约成倍增加。
+- **Context:** 2026-09-28 autoplan CEO E2。判定均值仍只用 h=10 的不重叠锚点。扫描是附录，不是第二条判定规则。
+- **Depends on:** 全量审计 JSON 已经是 `status: ok`。
+
+## 不要在审计 JSON 之前改生产目标只数
+
+- **What:** 在 summary 给出档位之前，不要把 `POOL_TARGET_COUNT` 改成 150 或 200 去做「顺便看一眼 HTML 会不会变大」。
+- **Why:** 目标只数一改，日更池子和被测量的算法就不是同一个。审计要回答的问题会作废。
+- **Pros:** 明天的 100 只观察池保持不动，档位仍然可比。
+- **Cons:** 不知道下游 HTML 在 150 只时有多大，要等审计结束再量。
+- **Context:** 2026-09-28 autoplan CEO E6。操作者本意是先测量再改。这一条是把那条约束写进待办，避免以后的改动把它当成可以提前做的探针。
+- **Depends on:** 全量审计 JSON 的档位，加上和生产 CSV 的 Jaccard。
