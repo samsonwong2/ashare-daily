@@ -28,3 +28,12 @@ Deferred on 2026-09-25 during the src-layout review. None of these block the mov
 - **Cons:** 仓库会有一条还没做的 CI 说明。
 - **Context:** 安装方式是 clone 之后 `pip install -e .`。不发 PyPI，不做容器。Qlib 行情数据不在包里。旧树仍是日更入口，直到八条命令各成功一次。
 - **Depends on:** 布局验收通过，并且八条长任务在新命令上各成功一次。
+
+## 生产聚类窗口拉到真正的 252 日
+
+- **What:** 等召回率审计出数之后，把 `configs/shared_filter_config.json` 的 `test_period` 起点前移，让日更 `cluster-map` 的面板长于 253 行，从而用上 `CLUSTER_LOOKBACK_DAYS=252`，而不是现在约 244 个交易日的整段。
+- **Why:** `prepare_recent_window` 要 253 行。当前 `test_period` 是 2025-06-30 到 2026-06-30，短于这个尾巴，生产实际把整段短面板拿去聚类。审计器评的是真正的 252 日。两套池子要用 Jaccard 对照，不能在审计完成前改日更。
+- **Pros:** 日更池子和被审计的算法变成同一个窗口，召回率结论才能直接指导 `POOL_TARGET_COUNT`。
+- **Cons:** 改配置会改变每天的池子。审计没出数之前改，测量对象和生产同时变。
+- **Context:** 2026-09-28 eng review D1/D16/D21。审计器故意不改这条配置。summary JSON 里的 Jaccard 是差距的证据。从 `shared_filter_config.json` 的 `test_period[0]` 改起，不要改 `prepare_recent_window`。
+- **Depends on:** `recall_audit` 全量跑完，并且 summary 里已经有和生产池的 Jaccard。
