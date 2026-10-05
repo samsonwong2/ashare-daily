@@ -21,6 +21,17 @@ def test_real_date_is_not_rejected() -> None:
     assert parse_as_of("2026-09-25") == "2026-09-25"
 
 
+def test_empty_plotly_root_still_finds_listing_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ashare_daily.daily_contract import resolve_listing_dir
+
+    root = tmp_path / "plotly"
+    listing = root / "20260930_from_listing_stock"
+    listing.mkdir(parents=True)
+    monkeypatch.setenv("PLOTLY_ROOT", str(root))
+    found = resolve_listing_dir("/20260930_from_listing")
+    assert found == listing
+
+
 def test_listing_dir_fills_trigger_dates() -> None:
     from pathlib import Path
 

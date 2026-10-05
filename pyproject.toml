@@ -28,3 +28,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "-m 'not recall_qlib'"
+markers = [
+  "recall_qlib: opt-in qlib snapshot check for the recall auditor",
+]

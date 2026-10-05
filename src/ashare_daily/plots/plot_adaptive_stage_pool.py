@@ -59,7 +59,6 @@ from ashare_daily.plots.adaptive_stage_common import (  # noqa: E402
 from ashare_daily.lib.early_down_alert import detect_early_down_marks  # noqa: E402
 from ashare_daily.lib.early_down_alert import early_down_flags_frame  # noqa: E402
 from ashare_daily.hrp.hrp_cluster_router import (  # noqa: E402
-    DEFAULT_MEMBERSHIP_CSV,
     code_mode_map,
     load_cluster_membership,
     mode_allows_diagnostic_marks,
@@ -102,7 +101,8 @@ from ashare_daily.plots.self_train_policy import (  # noqa: E402
     policy_frame_from_eval,
 )
 from ashare_daily.lib.symbol_trend_board import load_cluster_mapping_codes  # noqa: E402
-from ashare_daily.paths import CLUSTER_MAPPING_SELECTED_TXT, VALIDATION_DIR, plotly_outputs_dir, repo_root  # noqa: E402
+from ashare_daily.paths import VALIDATION_DIR, plotly_outputs_dir, repo_root  # noqa: E402
+from ashare_daily.screen import default_universe_txt  # noqa: E402
 
 _PROJECT_ROOT = repo_root()
 
@@ -626,7 +626,11 @@ def oos_one(
     baseline_method = str(
         (cfg.get("method_select_meta") or {}).get("baseline") or method
     )
-    if baseline_method in ev.METHODS:
+    if baseline_method == method:
+        baseline_full = px.regime.to_numpy(dtype=object)
+        window_mask = ((px.as_of >= start_date) & (px.as_of <= end_date)).to_numpy()
+        baseline_w = np.asarray(baseline_full, dtype=object)[window_mask]
+    elif baseline_method in ev.METHODS:
         baseline_full = ev.run_method(baseline_method, px)
         window_mask = ((px.as_of >= start_date) & (px.as_of <= end_date)).to_numpy()
         baseline_w = np.asarray(baseline_full, dtype=object)[window_mask]
@@ -636,8 +640,16 @@ def oos_one(
     baseline_diff = float(np.mean(baseline_w != px_w.regime.to_numpy(object)))
     aev, stats, open_mtm = simulate_adaptive_book(px_w, rules=_rules_for_sim(cfg))
 
-    # Fixed hybrid comparison on same OOS window
-    px_fix = prepare_features(ev, ohlcv_work, method=FIXED_HYBRID_RULES["method"])
+    # Fixed hybrid comparison on same OOS window. Feature columns do not
+    # depend on the regime method, so only the label column is recomputed.
+    px_fix = px.copy()
+    px_fix["regime"] = label_regime(
+        ev,
+        px_fix,
+        FIXED_HYBRID_RULES["method"],
+        {},
+        sticky_guard=False,
+    )
     px_fx_w = px_fix[(px_fix.as_of >= start_date) & (px_fix.as_of <= end_date)].reset_index(drop=True)
     _, stats_fx, _ = simulate_adaptive_book(px_fx_w, rules=_rules_for_sim({"rules": FIXED_HYBRID_RULES}))
 
@@ -671,7 +683,7 @@ def oos_one(
         template="plotly_white",
         init_qlib=False,
         kline_plotter_cls=None,
-        live_snapshot=live_snapshot,
+        live_snapshot=None,
         need_frame=(
             None
             if str(code).upper() in DEFAULT_DEFENSIVE_CODES
@@ -683,6 +695,9 @@ def oos_one(
         policy_meta=policy_meta,
         train_cutoff=train_cutoff,
         fair_path_extra_trail_years=fair_path_extra_trail_years,
+        erp_ann=ANCHOR_ERP_ANN,
+        equity_anchor_label=EQUITY_ANCHOR_LABEL,
+        ohlcv_full=ohlcv_work,
     )
     ru = cfg["rules"]
 
@@ -970,7 +985,7 @@ def prepare_adaptive_runtime(
     trade_mode: str,
     retrain: bool,
     fail_fast: bool,
-    hrp_membership_csv: Path,
+    hrp_membership_csv: Path | None,
     disable_ru_diag: bool,
     enable_shallow_up_trade: bool = False,
     train_cache_dir: Path | None = None,
@@ -999,7 +1014,7 @@ def prepare_adaptive_runtime(
         )
 
     val_dir = validation_dir if validation_dir.is_absolute() else _PROJECT_ROOT / validation_dir
-    mapping = Path(cluster_mapping) if cluster_mapping else CLUSTER_MAPPING_SELECTED_TXT
+    mapping = Path(cluster_mapping) if cluster_mapping else default_universe_txt()
     if not mapping.is_absolute():
         mapping = _PROJECT_ROOT / mapping
 
@@ -1046,17 +1061,20 @@ def prepare_adaptive_runtime(
     hrp_mode_by_code: dict[str, str] | None = None
     if enable_ru_diag or enable_shallow_up_trade:
         mem_path = hrp_membership_csv
-        if not mem_path.is_absolute():
-            mem_path = _PROJECT_ROOT / mem_path
-        if mem_path.exists():
-            try:
-                mem = load_cluster_membership(mem_path)
-                hrp_mode_by_code = code_mode_map(mem, paint_cluster_modes(mem))
-            except Exception as exc:  # noqa: BLE001
-                print(f"[hrp-meta-skip] failed to load membership: {exc}")
-                hrp_mode_by_code = None
+        if mem_path is None or not str(mem_path).strip():
+            print("[hrp-meta-skip] membership unset")
         else:
-            print(f"[hrp-meta-skip] membership missing: {mem_path}")
+            if not mem_path.is_absolute():
+                mem_path = _PROJECT_ROOT / mem_path
+            if mem_path.exists():
+                try:
+                    mem = load_cluster_membership(mem_path)
+                    hrp_mode_by_code = code_mode_map(mem, paint_cluster_modes(mem))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[hrp-meta-skip] failed to load membership: {exc}")
+                    hrp_mode_by_code = None
+            else:
+                print(f"[hrp-meta-skip] membership missing: {mem_path}")
 
     reuse = _train_cache_reusable(
         retrain=retrain,
@@ -1291,6 +1309,27 @@ def _oos_one_worker(code: str) -> tuple[str, dict | None, str | None]:
         return code, None, str(exc)
 
 
+def adaptive_page_exists(out_dir: Path, code: str, start: str, end: str) -> bool:
+    """True when a non-empty adaptive HTML already exists for this code and window."""
+    start_tag = pd.Timestamp(start).strftime("%Y%m%d")
+    end_tag = pd.Timestamp(end).strftime("%Y%m%d")
+    pattern = f"regime_transition_{str(code).upper()}_*_{start_tag}_{end_tag}_adaptive.html"
+    return any(path.is_file() and path.stat().st_size > 0 for path in out_dir.glob(pattern))
+
+
+def codes_to_render(
+    codes: list[str],
+    out_dir: Path,
+    start: str,
+    end: str,
+    force: bool,
+) -> list[str]:
+    """Codes that still need an OOS HTML pass. ``force`` redraws every code."""
+    if force:
+        return list(codes)
+    return [code for code in codes if not adaptive_page_exists(out_dir, code, start, end)]
+
+
 def _run_oos_batch(
     *,
     codes: list[str],
@@ -1408,7 +1447,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--hrp-membership-csv",
         type=Path,
-        default=DEFAULT_MEMBERSHIP_CSV,
+        default=None,
         help="HRP cluster_representatives CSV (optional metadata on RU marks)",
     )
     p.add_argument(
@@ -1464,7 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = plotly_outputs_dir() / f"{end_tag}all_adaptive"
     out_dir = out_dir if out_dir.is_absolute() else _PROJECT_ROOT / out_dir
 
-    mapping = Path(args.cluster_mapping) if args.cluster_mapping else CLUSTER_MAPPING_SELECTED_TXT
+    mapping = Path(args.cluster_mapping) if args.cluster_mapping else default_universe_txt()
     if not mapping.is_absolute():
         mapping = _PROJECT_ROOT / mapping
     codes = [c.upper() for c in (args.code or [])] or list(load_cluster_mapping_codes(mapping))
@@ -1532,10 +1571,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # OOS
-    print("[oos] frozen execute + HTML")
+    force_redraw = bool(args.retrain) or args.live_snapshot is not None
+    render_codes = codes_to_render(codes, out_dir, start, end, force_redraw)
+    skipped = len(codes) - len(render_codes)
+    if skipped:
+        print(f"[oos] skip {skipped} codes with existing HTML for {start}→{end}")
+    print(f"[oos] frozen execute + HTML ({len(render_codes)}/{len(codes)})")
     try:
         rows, oos_errors = _run_oos_batch(
-            codes=codes,
+            codes=render_codes,
             jobs=int(args.jobs),
             ctx=oos_ctx,
             fail_fast=bool(args.fail_fast),

@@ -40,7 +40,8 @@ from pathlib import Path
 import pandas as pd
 
 from ashare_daily.lib.symbol_trend_board import load_cluster_mapping_codes  # noqa: E402
-from ashare_daily.paths import CLUSTER_MAPPING_SELECTED_TXT, plotly_outputs_dir, repo_root  # noqa: E402
+from ashare_daily.paths import plotly_outputs_dir, repo_root  # noqa: E402
+from ashare_daily.screen import default_universe_txt  # noqa: E402
 
 _PROJECT_ROOT = repo_root()
 
@@ -124,7 +125,7 @@ def resolve_codes(args: argparse.Namespace) -> list[str]:
     mapping = (
         Path(args.cluster_mapping)
         if args.cluster_mapping
-        else Path(CLUSTER_MAPPING_SELECTED_TXT)
+        else default_universe_txt()
     )
     if not mapping.is_absolute():
         mapping = _PROJECT_ROOT / mapping

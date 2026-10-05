@@ -250,6 +250,7 @@ def _add_own_log_trail_kline_row(
     dual_peers: list[tuple[float, pd.Series]] | None = None,
     show_candles: bool = True,
     hover_asset_name: str | None = None,
+    fit_cache: tuple[pd.Series, pd.Series] | None = None,
 ) -> tuple[pd.Series, pd.Series, float]:
     """Draw clean K + trailing-log fair path (+ P95 rails) on one subplot row.
 
@@ -270,12 +271,15 @@ def _add_own_log_trail_kline_row(
             row=row,
             col=1,
         )
-    erp_fit, g_fit = trailing_log_trend_price_path(
-        close_fit,
-        trail_years=float(trail_years),
-        min_bars=_trail_fit_min_bars(float(trail_years)),
-        fallback_erp=float(erp_ann),
-    )
+    if fit_cache is not None:
+        erp_fit, g_fit = fit_cache
+    else:
+        erp_fit, g_fit = trailing_log_trend_price_path(
+            close_fit,
+            trail_years=float(trail_years),
+            min_bars=_trail_fit_min_bars(float(trail_years)),
+            fallback_erp=float(erp_ann),
+        )
     if align_from_long_history:
         erp_path = _align_series_to_plot(erp_fit, df)
         g_aln = _align_series_to_plot(g_fit, df)
@@ -1195,6 +1199,91 @@ def log_trend_price_path(
     return out, g_ann
 
 
+def _fill_trailing_log_ols(
+    y_arr: np.ndarray,
+    path_arr: np.ndarray,
+    g_arr: np.ndarray,
+    *,
+    min_b: int,
+    trail_bars: int,
+    tdy: float,
+) -> None:
+    """Closed-form trailing OLS for a gap-free positive close series.
+
+    ``x`` is the offset inside each window (0..n-1), matching ``np.polyfit`` on
+    ``flatnonzero`` of an all-valid slice. Prefix sums make each bar O(1).
+    """
+    n = len(y_arr)
+    if n < min_b:
+        return
+    log_y = np.log(y_arr)
+    sy_c = np.empty(n + 1, dtype=float)
+    sxy_c = np.empty(n + 1, dtype=float)
+    sy_c[0] = 0.0
+    sxy_c[0] = 0.0
+    idx = np.arange(n, dtype=float)
+    np.cumsum(log_y, out=sy_c[1:])
+    np.cumsum(idx * log_y, out=sxy_c[1:])
+    for t in range(min_b - 1, n):
+        start = 0
+        if trail_bars > 0 and (t + 1) >= trail_bars:
+            start = t + 1 - trail_bars
+        n_ok = t - start + 1
+        if n_ok < min_b:
+            continue
+        sy = sy_c[t + 1] - sy_c[start]
+        sxy = (sxy_c[t + 1] - sxy_c[start]) - start * sy
+        nm1 = n_ok - 1
+        sx = nm1 * n_ok / 2.0
+        sxx = nm1 * n_ok * (2 * n_ok - 1) / 6.0
+        den = n_ok * sxx - sx * sx
+        if den == 0.0 or not np.isfinite(den):
+            continue
+        b = (n_ok * sxy - sx * sy) / den
+        a = (sy - b * sx) / n_ok
+        if not np.isfinite(a) or not np.isfinite(b):
+            continue
+        path_arr[t] = float(np.exp(a + b * nm1))
+        g_arr[t] = float(np.exp(b * tdy) - 1.0)
+
+
+def _fill_trailing_log_ols_gappy(
+    y_arr: np.ndarray,
+    path_arr: np.ndarray,
+    g_arr: np.ndarray,
+    *,
+    min_b: int,
+    trail_bars: int,
+    tdy: float,
+) -> None:
+    """Same fit as the gap-free path when some closes are missing or non-positive."""
+    n = len(y_arr)
+    for t in range(n):
+        start = 0
+        if trail_bars > 0 and (t + 1) >= trail_bars:
+            start = t + 1 - trail_bars
+        sl = y_arr[start : t + 1]
+        ok = np.isfinite(sl) & (sl > 0)
+        n_ok = int(ok.sum())
+        if n_ok < min_b:
+            continue
+        jj = np.flatnonzero(ok).astype(float)
+        log_y = np.log(sl[ok])
+        sx = float(jj.sum())
+        sy = float(log_y.sum())
+        sxx = float(np.dot(jj, jj))
+        sxy = float(np.dot(jj, log_y))
+        den = n_ok * sxx - sx * sx
+        if den == 0.0 or not np.isfinite(den):
+            continue
+        b = (n_ok * sxy - sx * sy) / den
+        a = (sy - b * sx) / n_ok
+        if not np.isfinite(a) or not np.isfinite(b):
+            continue
+        path_arr[t] = float(np.exp(a + b * float(jj[-1])))
+        g_arr[t] = float(np.exp(b * tdy) - 1.0)
+
+
 def trailing_log_trend_price_path(
     close: pd.Series,
     *,
@@ -1236,22 +1325,10 @@ def trailing_log_trend_price_path(
     path_arr = np.full(n, np.nan, dtype=float)
     g_arr = np.full(n, np.nan, dtype=float)
     fb = float(fallback_erp) if np.isfinite(fallback_erp) else float("nan")
-    for t in range(n):
-        start = 0
-        if trail_bars > 0 and (t + 1) >= trail_bars:
-            start = t + 1 - trail_bars
-        sl = y_arr[start : t + 1]
-        ok = np.isfinite(sl) & (sl > 0)
-        n_ok = int(ok.sum())
-        if n_ok < min_b:
-            continue
-        jj = np.flatnonzero(ok).astype(float)
-        log_y = np.log(sl[ok])
-        b, a = np.polyfit(jj, log_y, 1)
-        if not np.isfinite(a) or not np.isfinite(b):
-            continue
-        path_arr[t] = float(np.exp(a + b * float(jj[-1])))
-        g_arr[t] = float(np.exp(b * tdy) - 1.0)
+    if np.isfinite(y_arr).all() and np.all(y_arr > 0):
+        _fill_trailing_log_ols(y_arr, path_arr, g_arr, min_b=min_b, trail_bars=trail_bars, tdy=tdy)
+    else:
+        _fill_trailing_log_ols_gappy(y_arr, path_arr, g_arr, min_b=min_b, trail_bars=trail_bars, tdy=tdy)
     # Warmup: before min_bars, fall back to endpoint CAGR on the expanding prefix
     # once we have ≥2 points (keeps a continuous ruler on young listings).
     first_fit = int(np.flatnonzero(np.isfinite(path_arr))[0]) if np.isfinite(path_arr).any() else n
@@ -1775,6 +1852,73 @@ def causal_path_residual_signed_percentile(
         if rt > 0:
             signed[t] = q_t
         elif rt < 0:
+            signed[t] = -q_t
+        else:
+            signed[t] = 0.0
+    out.iloc[:] = signed
+    return out
+
+
+def ewma_path_residual_signed_percentile(
+    path: pd.Series,
+    close: pd.Series,
+    *,
+    min_bars: int | None = None,
+    lam: float | None = None,
+) -> pd.Series:
+    """Causal signed percentile of ``|z|=|ln(close/path)|/σ_ewma`` vs history ``≤ t``."""
+    from ashare_daily.lib.ewma_fair_rails import (
+        DEFAULT_EWMA_LAMBDA,
+        DEFAULT_MIN_BARS,
+        ewma_residual_sigma,
+    )
+
+    p = pd.to_numeric(path, errors="coerce")
+    c = pd.to_numeric(close, errors="coerce")
+    out = pd.Series(np.nan, index=p.index, dtype=float)
+    min_b = int(DEFAULT_MIN_BARS) if min_bars is None else max(2, int(min_bars))
+    lam_f = float(DEFAULT_EWMA_LAMBDA) if lam is None else float(lam)
+    if p.empty or not (0.0 < lam_f < 1.0):
+        return out
+    path_arr = p.to_numpy(dtype=float)
+    close_arr = c.to_numpy(dtype=float)
+    n = len(path_arr)
+    r_arr = np.full(n, np.nan, dtype=float)
+    n_c = len(close_arr)
+    for t in range(n):
+        if t >= n_c:
+            continue
+        pt = float(path_arr[t])
+        ct = float(close_arr[t])
+        if np.isfinite(pt) and pt > 0 and np.isfinite(ct) and ct > 0:
+            rt = float(np.log(ct / pt))
+            if np.isfinite(rt):
+                r_arr[t] = rt
+    r = pd.Series(r_arr, index=p.index, dtype=float)
+    sigma = ewma_residual_sigma(r, lam=lam_f)
+    r_arr = r.to_numpy(dtype=float)
+    s_arr = sigma.to_numpy(dtype=float)
+    signed = np.full(n, np.nan, dtype=float)
+    abs_z: list[float] = []
+    for t in range(n):
+        rt = float(r_arr[t])
+        st = float(s_arr[t])
+        zt = float("nan")
+        if np.isfinite(st) and st > 0 and np.isfinite(rt):
+            zt = rt / st
+            if not np.isfinite(zt):
+                zt = float("nan")
+        if np.isfinite(zt):
+            abs_z.append(abs(zt))
+        if len(abs_z) < min_b or not np.isfinite(zt):
+            continue
+        hist = np.asarray(abs_z, dtype=float)
+        q_t = float(np.mean(hist <= abs(zt)))
+        if not np.isfinite(q_t):
+            continue
+        if zt > 0:
+            signed[t] = q_t
+        elif zt < 0:
             signed[t] = -q_t
         else:
             signed[t] = 0.0
@@ -2410,14 +2554,16 @@ def build_candle_volume_vol_figure(
         if mode == "own_log_trend_trail" or extra_trails:
             primary_years = float(FAIR_PATH_LOG_TREND_TRAIL_YEARS)
             g_by_years: dict[float, pd.Series] = {}
+            fit_by_years: dict[float, tuple[pd.Series, pd.Series]] = {}
             all_years = [primary_years] + list(extra_trails)
             for y in all_years:
-                _p, g_fit = trailing_log_trend_price_path(
+                path_fit, g_fit = trailing_log_trend_price_path(
                     close_fit,
                     trail_years=float(y),
                     min_bars=_trail_fit_min_bars(float(y)),
                     fallback_erp=float(erp_ann),
                 )
+                fit_by_years[float(y)] = (path_fit, g_fit)
                 g_by_years[float(y)] = (
                     _align_series_to_plot(g_fit, df) if align_long else g_fit
                 )
@@ -2440,6 +2586,7 @@ def build_candle_volume_vol_figure(
                 dual_peers=_peers_for(primary_years) if extra_trails else None,
                 show_candles=True,
                 hover_asset_name=hover_asset_name,
+                fit_cache=fit_by_years[primary_years],
             )
             need_aligned = g7_aln
             erp_path = _erp7
@@ -2472,6 +2619,7 @@ def build_candle_volume_vol_figure(
                     dual_peers=_peers_for(ey),
                     show_candles=True,
                     hover_asset_name=hover_asset_name,
+                    fit_cache=fit_by_years[float(ey)],
                 )
         else:
             # Clean K-line (no MA / markers / regime overlays) vs fair need path.
@@ -2855,18 +3003,24 @@ def build_figure(
     policy_meta: dict | None = None,
     train_cutoff: str | None = None,
     fair_path_extra_trail_years: float | list[float] | tuple[float, ...] | str | None = None,
+    erp_ann: float = ANCHOR_ERP_ANN,
+    equity_anchor_label: str = EQUITY_ANCHOR_LABEL,
+    ohlcv_full: pd.DataFrame | None = None,
 ) -> tuple[go.Figure, pd.DataFrame, str]:
-    ohlcv_full = load_qlib_ohlcv(
-        code,
-        start_date,
-        end_date,
-        provider_uri=provider_uri,
-        init_qlib=init_qlib,
-        lookback_calendar_days=fair_path_lookback_calendar_days(
-            extra_trail_years=fair_path_extra_trail_years
-        ),
-        clip_to_window=False,
-    )
+    if ohlcv_full is not None and not ohlcv_full.empty:
+        ohlcv_full = ohlcv_full.copy()
+    else:
+        ohlcv_full = load_qlib_ohlcv(
+            code,
+            start_date,
+            end_date,
+            provider_uri=provider_uri,
+            init_qlib=init_qlib,
+            lookback_calendar_days=fair_path_lookback_calendar_days(
+                extra_trail_years=fair_path_extra_trail_years
+            ),
+            clip_to_window=False,
+        )
     provisional_note = ""
     if live_snapshot is not None and not live_snapshot.empty:
         ohlcv_full = apply_live_snapshot_to_ohlcv(
@@ -2959,8 +3113,8 @@ def build_figure(
         vol_frame,
         template=template,
         need_frame=need_frame,
-        erp_ann=ANCHOR_ERP_ANN,
-        equity_anchor_label=EQUITY_ANCHOR_LABEL,
+        erp_ann=float(erp_ann),
+        equity_anchor_label=str(equity_anchor_label or EQUITY_ANCHOR_LABEL),
         policy_frame=policy_frame,
         policy_meta=policy_meta,
         train_cutoff=train_cutoff,

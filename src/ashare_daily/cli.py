@@ -1,4 +1,4 @@
-"""``ashare-daily`` console script. Eight subcommands, one entry."""
+"""``ashare-daily`` console script. Thirteen subcommands, one entry."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,10 @@ from ashare_daily.daily_contract import parse_as_of, slice_after_command
 from ashare_daily.paths import repo_root
 
 COMMANDS = (
+    "cn-data",
     "pool-merge",
+    "screen",
+    "screen-review",
     "cluster-map",
     "cluster-review",
     "regime",
@@ -18,6 +21,7 @@ COMMANDS = (
     "listing",
     "hrp",
     "triggers",
+    "rules7",
 )
 
 

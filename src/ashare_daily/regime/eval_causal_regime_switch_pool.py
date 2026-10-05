@@ -375,17 +375,13 @@ def apply_lowvol_range_bias(
     vp = np.asarray(vol_pct, dtype=float)
     p60 = np.asarray(prior60, dtype=float)
     p20 = np.asarray(prior20, dtype=float)
-    for i in range(n):
-        lo = max(0, i - look + 1)
-        window = vp[lo : i + 1]
-        n_low = int(np.sum(np.isfinite(window) & (window < low_pct)))
-        if n_low < persist:
-            continue
-        a60 = abs(p60[i]) if np.isfinite(p60[i]) else 0.0
-        a20 = abs(p20[i]) if np.isfinite(p20[i]) else 0.0
-        if a60 >= escape_p60 or a20 >= escape_p20:
-            continue
-        labs[i] = "range"
+    look_n = max(1, int(look))
+    low = np.isfinite(vp) & (vp < low_pct)
+    n_low = np.convolve(low.astype(np.int32), np.ones(look_n, dtype=np.int32), mode="full")[:n]
+    a60 = np.where(np.isfinite(p60), np.abs(p60), 0.0)
+    a20 = np.where(np.isfinite(p20), np.abs(p20), 0.0)
+    force = (n_low >= int(persist)) & (a60 < escape_p60) & (a20 < escape_p20)
+    labs[force] = "range"
     return labs
 
 
@@ -406,6 +402,56 @@ def finalize_regime_labels(labels: np.ndarray, px: pd.DataFrame, *, min_seg: int
 
 
 def causal_smooth(labs: list[str], w: int = 5) -> list[str]:
+    """Majority label over the trailing ``w`` bars.
+
+    Ties keep the lexicographically first label, matching ``np.unique`` then
+    ``argmax`` on the old per-bar loop.
+    """
+    n = len(labs)
+    if n == 0:
+        return []
+    width = max(1, int(w))
+    if width == 1:
+        return [str(lab) for lab in labs]
+    idx = np.empty(n, dtype=np.int8)
+    for i, lab in enumerate(labs):
+        text = str(lab)
+        if text == "down":
+            idx[i] = 0
+        elif text == "range":
+            idx[i] = 1
+        elif text == "up":
+            idx[i] = 2
+        else:
+            return _causal_smooth_generic(labs, width)
+    c0 = c1 = c2 = 0
+    out = [""] * n
+    for i in range(n):
+        code = int(idx[i])
+        if code == 0:
+            c0 += 1
+        elif code == 1:
+            c1 += 1
+        else:
+            c2 += 1
+        if i >= width:
+            old = int(idx[i - width])
+            if old == 0:
+                c0 -= 1
+            elif old == 1:
+                c1 -= 1
+            else:
+                c2 -= 1
+        if c0 >= c1 and c0 >= c2:
+            out[i] = "down"
+        elif c1 >= c2:
+            out[i] = "range"
+        else:
+            out[i] = "up"
+    return out
+
+
+def _causal_smooth_generic(labs: list[str], w: int) -> list[str]:
     out = []
     for i in range(len(labs)):
         sl = labs[max(0, i - w + 1) : i + 1]
@@ -641,18 +687,25 @@ def _ma_stack_raw_labels(px: pd.DataFrame, *, soft_hold60: bool) -> list[str]:
     Range-first (conservative): wider chop/hug bands and no bare C≥MA20→up fallback,
     so low-vol chop stays range instead of flickering into short up/down legs.
     """
-    raw: list[str] = []
-    for _, r in px.iterrows():
-        if pd.isna(r["MA20"]) or pd.isna(r["MA60"]):
-            raw.append("range")
+    close = px["$close"].to_numpy(dtype=float)
+    ma20 = px["MA20"].to_numpy(dtype=float)
+    ma60 = px["MA60"].to_numpy(dtype=float)
+    prior20 = px["prior20"].to_numpy(dtype=float)
+    prior60 = px["prior60"].to_numpy(dtype=float)
+    band60 = px["band60"].to_numpy(dtype=float)
+    raw = ["range"] * len(close)
+    for i in range(len(close)):
+        m20 = ma20[i]
+        m60 = ma60[i]
+        if not np.isfinite(m20) or not np.isfinite(m60):
             continue
-        c, m20, m60 = float(r["$close"]), float(r["MA20"]), float(r["MA60"])
-        p20 = float(r["prior20"]) if pd.notna(r["prior20"]) else 0.0
-        p60 = float(r["prior60"]) if pd.notna(r["prior60"]) else 0.0
-        band = float(r["band60"]) if pd.notna(r["band60"]) else np.nan
+        c = close[i]
+        p20 = prior20[i] if np.isfinite(prior20[i]) else 0.0
+        p60 = prior60[i] if np.isfinite(prior60[i]) else 0.0
+        band = band60[i]
         hug = abs(m20 - m60) / c < 0.02
         # Wider chop than before (0.18/0.08): low-vol ETFs default to range.
-        chop = (pd.notna(band) and band < 0.22 and abs(p60) < 0.10) or (
+        chop = (np.isfinite(band) and band < 0.22 and abs(p60) < 0.10) or (
             hug and abs(p60) < 0.12
         )
         if soft_hold60:
@@ -684,14 +737,9 @@ def _ma_stack_raw_labels(px: pd.DataFrame, *, soft_hold60: bool) -> list[str]:
         # Directional stack wins over chop. No bare C vs MA20 fallback — that
         # painted low-vol bounces as up/down (France/HK chop).
         if up and not down:
-            lab = "up"
+            raw[i] = "up"
         elif down and not up:
-            lab = "down"
-        elif chop:
-            lab = "range"
-        else:
-            lab = "range"
-        raw.append(lab)
+            raw[i] = "down"
     return raw
 
 
@@ -943,22 +991,27 @@ def method_hybrid_v1_params(
 ) -> np.ndarray:
     """MA stack + ADX confirm with optional enter confirm / smooth."""
     base = method_ma_stack_params(px, confirm=confirm, smooth=smooth)
-    out = []
+    adx_a = px["adx14"].to_numpy(dtype=float)
+    p20_a = px["prior20"].to_numpy(dtype=float)
+    p60_a = px["prior60"].to_numpy(dtype=float)
+    close_a = px["$close"].to_numpy(dtype=float)
+    ma20_a = px["MA20"].to_numpy(dtype=float)
+    out = np.empty(len(base), dtype=object)
     for i, lab in enumerate(base):
-        adx = float(px.iloc[i]["adx14"]) if pd.notna(px.iloc[i]["adx14"]) else 0.0
-        p20 = float(px.iloc[i]["prior20"]) if pd.notna(px.iloc[i]["prior20"]) else 0.0
-        p60 = float(px.iloc[i]["prior60"]) if pd.notna(px.iloc[i]["prior60"]) else 0.0
-        c = float(px.iloc[i]["$close"])
-        m20 = float(px.iloc[i]["MA20"]) if pd.notna(px.iloc[i]["MA20"]) else np.nan
+        adx = float(adx_a[i]) if np.isfinite(adx_a[i]) else 0.0
+        p20 = float(p20_a[i]) if np.isfinite(p20_a[i]) else 0.0
+        p60 = float(p60_a[i]) if np.isfinite(p60_a[i]) else 0.0
+        c = float(close_a[i])
+        m20 = float(ma20_a[i]) if np.isfinite(ma20_a[i]) else np.nan
         mom = abs(p60) >= 0.06 or abs(p20) >= 0.04
         above = np.isfinite(m20) and c > m20
         if lab in ("up", "down") and adx < 15 and not mom and not (
             lab == "up" and above and p20 >= 0.02
         ):
-            out.append("range")
+            out[i] = "range"
         else:
-            out.append(lab)
-    return np.asarray(out, dtype=object)
+            out[i] = lab
+    return out
 
 
 def method_hybrid_v1(px: pd.DataFrame) -> np.ndarray:
@@ -983,20 +1036,20 @@ METHODS = {
 
 
 def method_adx_di_params(px: pd.DataFrame, *, adx_thr: float = 18, smooth: int = 5) -> np.ndarray:
-    raw = []
-    for _, r in px.iterrows():
-        adx = float(r["adx14"]) if pd.notna(r["adx14"]) else 0.0
-        pdi = float(r["plus_di"]) if pd.notna(r["plus_di"]) else 0.0
-        mdi = float(r["minus_di"]) if pd.notna(r["minus_di"]) else 0.0
+    adx_a = px["adx14"].to_numpy(dtype=float)
+    pdi_a = px["plus_di"].to_numpy(dtype=float)
+    mdi_a = px["minus_di"].to_numpy(dtype=float)
+    raw = ["range"] * len(adx_a)
+    for i in range(len(adx_a)):
+        adx = float(adx_a[i]) if np.isfinite(adx_a[i]) else 0.0
+        pdi = float(pdi_a[i]) if np.isfinite(pdi_a[i]) else 0.0
+        mdi = float(mdi_a[i]) if np.isfinite(mdi_a[i]) else 0.0
         if adx < adx_thr:
-            lab = "range"
-        elif pdi > mdi:
-            lab = "up"
+            continue
+        if pdi > mdi:
+            raw[i] = "up"
         elif mdi > pdi:
-            lab = "down"
-        else:
-            lab = "range"
-        raw.append(lab)
+            raw[i] = "down"
     above20 = (px["$close"] > px["MA20"]).fillna(False).to_numpy(bool)
     labs = apply_hysteresis(
         raw,

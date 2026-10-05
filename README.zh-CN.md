@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-A 股日常命令：股票池合并、聚类映射、聚类复查、状态验证、自适应 HTML、上市以来 HTML、HRP 树状图、次日触发价。
+A 股日常命令：Qlib `cn_data` 替换、股票池合并、聚类映射、聚类复查、状态验证、自适应 HTML、上市以来 HTML、HRP 树状图、次日触发价。
 
-需要 Qlib 的 `cn_data`。`pip` 不会下载这份行情。如果 `pip install` 找不到名为 `qlib` 的包，先按本机已有的方式装好 Qlib，再安装本仓库。
+需要 Qlib 的 `cn_data`。`pip` 不会下载这份行情，用 `ashare-daily cn-data` 替换。如果 `pip install` 找不到名为 `qlib` 的包，先按本机已有的方式装好 Qlib，再安装本仓库。
 
 ## 安装
 
@@ -29,11 +29,14 @@ ln -sfn /path/to/regime_transition_model_cache_stock runtime/decision_packs/regi
 
 按下面顺序跑。`adaptive` 读 `regime` 写出的验证目录。`listing` 读当天 `adaptive` 写出的 `all_adaptive_stock` 目录。这个目录不存在时，`listing` 退出并打印该路径，不会替你去跑 `adaptive`。
 
-只有 `listing` 会把 HTML 写进 `$PLOTLY_ROOT/20260924_from_listing_stock`。日期来自 `--as-of 2026-09-24`。其余命令分别写股票池、聚类表、状态信号分片、另一个 HTML 目录、HRP 页面或触发价表。
+只有 `listing` 会把 HTML 写进 `$PLOTLY_ROOT/20260924_from_listing_stock`。日期来自 `--as-of 2026-09-24`。`cn-data` 替换 Qlib 目录。后面的命令分别写股票池、聚类表、状态信号分片、另一个 HTML 目录、HRP 页面或触发价表。
 
 ```bash
+ashare-daily cn-data
 ashare-daily pool-merge
-ashare-daily cluster-map
+ashare-daily screen
+ashare-daily screen-review
+#ashare-daily cluster-map
 ashare-daily cluster-review
 ashare-daily regime --skip-rebuild --skip-html
 ashare-daily adaptive --as-of 2026-09-24
@@ -41,21 +44,42 @@ ashare-daily listing --as-of 2026-09-24
 ashare-daily hrp --asof-date 2026-09-24
 ashare-daily hrp --asof-date 2026-09-24 --dist-t 0.8
 ashare-daily triggers --listing-dir "$PLOTLY_ROOT/20260924_from_listing_stock"
+ashare-daily rules7 --as-of 2026-09-24
 ```
 
-`listing` 默认增量。加上 `--no-incremental` 才全量重算。listing 的 HTML 生成之后，图 7 到图 11 的 EWMA 上下轨一定会画，含 1 个月那一块。图 12 默认会画，加上 `--no-fig12` 才跳过。
+`listing` 默认增量。加上 `--no-incremental` 才全量重算。增量补丁会续上前一份 HTML 里已经画好的 EWMA 上下轨，不会再整目录重画这些轨。图 12 默认会画，加上 `--no-fig12` 才跳过。
+
+### `ashare-daily cn-data`
+
+用 [chenditc/investment_data](https://github.com/chenditc/investment_data) 的一个 Release 整份换掉 `/home/huangtuo/data/qlib_data/cn_data`。同一个标签下下载 `qlib_bin.tar.gz` 和 `qlib_bin.manifest.json`，再跑上游 `validate_archive.py --require-publishable`。校验和解压都成功后才替换目录。旧目录留在 `cn_data.bak.YYYYMMDD`；这个名字已经存在时，备份写成 `cn_data.bak.YYYYMMDD.2`。不写 `--tag` 时，标签是 GitHub 上的 latest release。`--tag 2026-10-04` 固定某一天。这个目录里后写的文件，由后面的命令重新生成。`pool-merge` 写 `instruments/csi1800.txt`。`screen` 写 `instruments/cluster_mapping_selected.txt`。真的去跑 `cluster-map` 时，它会覆盖这份 instruments 文件。
 
 ### `ashare-daily pool-merge`
 
 从本地 json 里的 Qlib instruments 目录读取 `csi800.txt` 和 `csi1000.txt`。各取最新结束日的成分，按代码取并集，在同一目录写出 `csi1800.txt`。这条不画 HTML。
 
+### `ashare-daily screen`
+
+给 `csi1800.txt` 里每只股票打 `cluster-map` 同一条低相关 / 高收益分（35% 低相关，65% 近 252 日累计涨幅）。分数 ≥ `0.85` 留下。写出 `$TEMP_DIR/stock_screen_scores.csv` 和 `$TEMP_DIR/stock_screen_selected.txt`，并把同一份 instruments 文件复制到 `instruments/cluster_mapping_selected.txt`。`adaptive` 和 `listing` 读 `$TEMP_DIR` 那份。`regime` 和 `hrp` 读 instruments 里那份。`--score-min` 改这条线。
+
+### `ashare-daily screen-review`
+
+读 `$TEMP_DIR/stock_screen_scores.csv`，用 `--as-of`（不写就是今天）之前的收盘价算近 5、20、60 日收益。写到 `$TEMP_DIR/stock_screen_review/{YYYYMMDD}/`：`missed_by_score.csv`、`weak_selected.csv` 和 `screen_review_{YYYYMMDD}.md`。第一张表是没选上、近 20 日涨得最好的。第二张表是选上、近 20 日最弱的。
+
 ### `ashare-daily cluster-map`
 
-用这批股票做生产聚类。默认距离 `0.60`、选出 100 只、评分用夏普动量、去噪关闭。写出 `cluster_mapping.csv`、`cluster_mapping_selected.csv` 和 `cluster_mapping_selected.txt`。风险步骤只有在本地 json 的 `paths.etf_risk_report_script` 指向真实文件时才会跑。产物在本地 json 的 `TEMP_DIR` 下，不在 `PLOTLY_ROOT` 下。
+不在日常顺序里。`adaptive` 和 `listing` 读 `screen` 写出的名单。这条命令仍是旧的聚类：距离 `0.60`、选出 100 只、评分用夏普动量、去噪关闭。写出 `cluster_mapping.csv`、`cluster_mapping_selected.csv` 和 `cluster_mapping_selected.txt`，都在 `TEMP_DIR` 下。风险步骤只有在本地 json 的 `paths.etf_risk_report_script` 指向真实文件时才会跑。
+
+召回率审计器不是子命令，也不改日更池子。`POOL_*` 会被忽略。判定带用目标 100、距离 0.60、10 个交易日、相关性 0.8 的近亲。下一次 `cluster-map` 之前，把 `stock_cluster_mapping_selected.csv` 和对应的 metadata JSON 复制成 `$TEMP_DIR/stock_cluster_mapping_selected_snapshot.csv` 与 `$TEMP_DIR/stock_cluster_mapping_selected_metadata_snapshot.json`，因为日更会覆盖现场文件。
+
+```bash
+python -m ashare_daily.pool.builder.recall_audit --max-anchors 5
+```
+
+这次试跑会覆盖 `$TEMP_DIR/pool_recall_audit.csv` 和 `pool_recall_audit_summary.json`。`band_scope` 为 `smoke` 时不是全量判定。qlib 标记默认不进测试。要跑它用 `pytest -m recall_qlib -o addopts=`。
 
 ### `ashare-daily cluster-review`
 
-拿同一次选出的 `stock_cluster_mapping_selected.csv`，对照完整的 `stock_cluster_mapping.csv` 做质量复查。`--future-end` 默认是今天。复查结果写到复查输出目录。这条不刷新 listing HTML。
+对照上一次留下的 `stock_cluster_mapping_selected.csv` 和 `stock_cluster_mapping.csv` 做质量复查。这两份是旧聚类表，不是 `stock_screen_scores.csv`。跳过 `cluster-map` 时，这两份文件保持原样。`--future-end` 默认是今天。复查结果写到复查输出目录。这条不刷新 screen 名单，也不刷新 listing HTML。
 
 ### `ashare-daily regime --skip-rebuild --skip-html`
 
@@ -67,7 +91,7 @@ ashare-daily triggers --listing-dir "$PLOTLY_ROOT/20260924_from_listing_stock"
 
 ### `ashare-daily listing --as-of 2026-09-24`
 
-按每只股票的上市日画到 2026-09-24。启动前同时要求 `2026-09.signals.csv` 和 `$PLOTLY_ROOT/20260924all_adaptive_stock` 都存在。adaptive 目录缺失时退出并打印该路径。HTML 写到 `$PLOTLY_ROOT/20260924_from_listing_stock`。增量模式会在 `PLOTLY_ROOT` 下找更早的 `*_from_listing_stock`，把中间缺的交易日补上。HTML 写完后，图 7 到图 11 会加上 EWMA 上下轨，含 1 个月那一块。图 12 默认会加，加上 `--no-fig12` 才跳过。
+按每只股票的上市日画到 2026-09-24。启动前同时要求 `2026-09.signals.csv` 和 `$PLOTLY_ROOT/20260924all_adaptive_stock` 都存在。adaptive 目录缺失时退出并打印该路径。HTML 写到 `$PLOTLY_ROOT/20260924_from_listing_stock`。增量模式会在 `PLOTLY_ROOT` 下找更早的 `*_from_listing_stock`，只补下一根 K 线。缺了不止一天就退回全量重画。补丁会续上前一份 HTML 里已经画好的 EWMA 上下轨。图 12 默认会加，加上 `--no-fig12` 才跳过。
 
 ### `ashare-daily hrp`
 
@@ -88,6 +112,10 @@ ashare-daily triggers \
   --as-of 2026-09-24 \
   --next-day 2026-09-25
 ```
+
+### `ashare-daily rules7 --as-of 2026-09-30`
+
+把当天的图9规则清单写进 `$PLOTLY_ROOT/20260930_from_listing_stock`：`rules7_checklist_{收盘日}.csv` 和 `.md`。不写 `--listing-dir` 时，目录由 `--as-of` 拼出来；两个都不写时，日期是今天。锚是 `SH000300`。`$TEMP_DIR/cluster_representatives_{YYYYMMDD}.csv` 存在时，清单带上聚类列。
 
 ## 示例页面
 

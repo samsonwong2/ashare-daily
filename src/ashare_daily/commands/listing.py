@@ -33,7 +33,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--config-source-dir", type=Path, default=None)
     p.add_argument("--html-out-dir", type=Path, default=None)
     p.add_argument("--no-fig12", action="store_true")
-    p.add_argument("--ru-diag", action="store_true")
+    p.add_argument("--disable-ru-diag", action="store_true")
     p.add_argument("--fair-path-extra-trail-years", default="1,0.5,0.25,1/12")
     return p
 
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         forwarded += ["--listing-cache", str(listing_cache)]
     if args.retrain:
         forwarded.append("--retrain")
-    if not args.ru_diag:
+    if args.disable_ru_diag:
         forwarded.append("--disable-ru-diag")
     if args.max_codes:
         forwarded += ["--max-codes", str(args.max_codes)]
@@ -100,18 +100,13 @@ def main(argv: list[str] | None = None) -> int:
     rc = shard_main(forwarded)
     if isinstance(rc, int) and rc != 0:
         return rc
-    ewma = ["--html-dir", str(html_dir), "--jobs", str(args.jobs)]
-    for code in codes:
-        ewma += ["--code", code]
-    from ashare_daily.plots.add_ewma_rails import main as ewma_main
-
-    rc = ewma_main(ewma)
-    if isinstance(rc, int) and rc != 0:
-        return rc
     if not args.no_fig12:
+        fig12 = ["--html-dir", str(html_dir), "--jobs", str(args.jobs)]
+        for code in codes:
+            fig12 += ["--code", code]
         from ashare_daily.plots.add_fig12_six_states import main as fig12_main
 
-        rc = fig12_main(ewma)
+        rc = fig12_main(fig12)
         if isinstance(rc, int) and rc != 0:
             return rc
     return 0

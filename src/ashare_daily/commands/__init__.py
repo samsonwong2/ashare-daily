@@ -16,8 +16,14 @@ def dispatch(command: str, rest: list[str]) -> int:
 
 
 def _module(command: str):
-    if command == "pool-merge":
+    if command == "cn-data":
+        from ashare_daily.commands import cn_data as module
+    elif command == "pool-merge":
         from ashare_daily.commands import pool_merge as module
+    elif command == "screen":
+        from ashare_daily.commands import screen as module
+    elif command == "screen-review":
+        from ashare_daily.commands import screen_review as module
     elif command == "cluster-map":
         from ashare_daily.commands import cluster_map as module
     elif command == "cluster-review":
@@ -32,6 +38,8 @@ def _module(command: str):
         from ashare_daily.commands import hrp as module
     elif command == "triggers":
         from ashare_daily.commands import triggers as module
+    elif command == "rules7":
+        from ashare_daily.commands import rules7 as module
     else:
         raise SystemExit(f"unknown command {command}")
     return module

@@ -52,14 +52,9 @@ from ashare_daily.plots.adaptive_stage_common import (  # noqa: E402
     TRADE_MODE_HOLD_UP,
     TRUTH_VERSION,
 )
-from ashare_daily.hrp.hrp_cluster_router import DEFAULT_MEMBERSHIP_CSV  # noqa: E402
 from ashare_daily.lib.symbol_trend_board import load_cluster_mapping_codes  # noqa: E402
-from ashare_daily.paths import (  # noqa: E402
-    CLUSTER_MAPPING_SELECTED_TXT,
-    VALIDATION_DIR,
-    plotly_outputs_dir,
-    repo_root,
-)
+from ashare_daily.paths import VALIDATION_DIR, plotly_outputs_dir, repo_root  # noqa: E402
+from ashare_daily.screen import default_universe_txt  # noqa: E402
 
 _PROJECT_ROOT = repo_root()
 
@@ -278,7 +273,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--hrp-membership-csv",
         type=Path,
-        default=DEFAULT_MEMBERSHIP_CSV,
+        default=None,
     )
     p.add_argument("--disable-ru-diag", action="store_true")
     p.add_argument(
@@ -340,6 +335,127 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _newday_switch_side(oos: pd.DataFrame, code: str, end_date: str) -> str | None:
+    """Quantile-switch side for (code, end_date) from validation signals."""
+    if oos is None or oos.empty or "quantile_switch" not in oos.columns:
+        return None
+    sub = oos[
+        (oos["code"].astype(str).str.upper() == str(code).upper())
+        & (pd.to_datetime(oos["as_of"]).dt.normalize() == pd.Timestamp(end_date))
+    ]
+    if sub.empty or not bool(sub["quantile_switch"].fillna(False).any()):
+        return None
+    side = str(sub.iloc[-1].get("switch_side") or "")
+    return side if side in {"up", "down"} else None
+
+
+def _newday_diamonds(rev: pd.DataFrame, code: str, end_date: str) -> list[dict[str, Any]]:
+    """Confirmation diamonds whose knowable date (T+3/T+10) falls on end_date."""
+    if rev is None or rev.empty:
+        return []
+    from ashare_daily.lib.regime_transition_plot import (
+        build_confirmation_marker_frame,
+        build_overlay_frame,
+    )
+
+    code_u = str(code).upper()
+    sub = rev[rev["code"].astype(str).str.upper() == code_u].copy()
+    if sub.empty:
+        return []
+    end = pd.Timestamp(end_date).normalize()
+    early_on = (
+        pd.to_datetime(sub["early_confirmed_on"], errors="coerce")
+        if "early_confirmed_on" in sub.columns
+        else pd.Series(pd.NaT, index=sub.index)
+    )
+    final_on = (
+        pd.to_datetime(sub["final_confirmed_on"], errors="coerce")
+        if "final_confirmed_on" in sub.columns
+        else pd.Series(pd.NaT, index=sub.index)
+    )
+    hit = sub[(early_on.dt.normalize() == end) | (final_on.dt.normalize() == end)]
+    if hit.empty:
+        return []
+    oos_stub = pd.DataFrame(
+        {
+            "as_of": pd.to_datetime(hit["as_of"]),
+            "code": code_u,
+            "quantile_switch": False,
+        }
+    )
+    overlay = build_overlay_frame(
+        oos_stub,
+        hit,
+        pd.DataFrame(),
+        code=code_u,
+        start_date=str(hit["as_of"].min())[:10],
+        end_date=end_date,
+    )
+    conf = build_confirmation_marker_frame(overlay)
+    if conf.empty:
+        return []
+    conf = conf[pd.to_datetime(conf["as_of"]).dt.normalize() == end]
+    out: list[dict[str, Any]] = []
+    for _, row in conf.iterrows():
+        post = row.get("post_ret")
+        post_s = f"{float(post):+.2%}" if pd.notna(post) else "n/a"
+        out.append(
+            dict(
+                reversal_marker=str(row.get("reversal_marker") or ""),
+                hover=(
+                    f"确认日={end_date}<br>拐点日={pd.Timestamp(row['origin_as_of']).date()}"
+                    f"<br>验证={row.get('reversal_label')}<br>post={post_s}"
+                ),
+            )
+        )
+    return out
+
+
+def listing_page_exists(out_dir: Path, code: str, end: str) -> bool:
+    """True when a non-empty from-listing HTML already exists for this end date."""
+    end_tag = pd.Timestamp(end).strftime("%Y%m%d")
+    code_u = str(code).upper()
+    for path in out_dir.glob(f"regime_transition_{code_u}_*_{end_tag}_adaptive.html"):
+        stem = path.stem
+        if any(token in stem for token in ("_fig9", "_fig10", "_oracle")):
+            continue
+        if path.is_file() and path.stat().st_size > 0:
+            return True
+    return False
+
+
+def listing_codes_to_render(
+    codes: list[str],
+    out_dir: Path,
+    end: str,
+    listing_csv: Path | None,
+    force: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Codes still needing a listing pass, plus CSV rows kept for skipped codes."""
+    if force:
+        return list(codes), []
+    saved: dict[str, dict[str, Any]] = {}
+    if listing_csv is not None and listing_csv.is_file():
+        try:
+            frame = pd.read_csv(listing_csv)
+        except Exception:  # noqa: BLE001
+            frame = pd.DataFrame()
+        if "code" in frame.columns:
+            for rec in frame.to_dict(orient="records"):
+                key = str(rec.get("code") or "").strip().upper()
+                if key:
+                    saved[key] = rec
+    render: list[str] = []
+    kept: list[dict[str, Any]] = []
+    for code in codes:
+        key = str(code).upper()
+        if key in saved and listing_page_exists(out_dir, key, end):
+            kept.append(saved[key])
+        else:
+            render.append(code)
+    return render, kept
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     end_raw = args.end_date or args.as_of
@@ -381,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
     mapping = (
         Path(args.cluster_mapping)
         if args.cluster_mapping
-        else Path(CLUSTER_MAPPING_SELECTED_TXT)
+        else default_universe_txt()
     )
     if not mapping.is_absolute():
         mapping = _PROJECT_ROOT / mapping
@@ -476,10 +592,24 @@ def main(argv: list[str] | None = None) -> int:
         write_book_csvs,
     )
 
+    force_redraw = bool(args.retrain) or args.live_snapshot is not None
+    render_codes, kept_listing_rows = listing_codes_to_render(
+        codes,
+        out_dir,
+        end_date,
+        out_dir / "listing_dates.csv",
+        force_redraw,
+    )
+    if kept_listing_rows:
+        print(
+            f"[INFO] skip {len(kept_listing_rows)} codes with existing listing HTML "
+            f"for {end_date}"
+        )
+
     listing_rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     summary_rows: list[dict[str, Any]] = []
-    for i, code in enumerate(codes, 1):
+    for i, code in enumerate(render_codes, 1):
         try:
             listing = listing_lookup.get(code)
             if not listing:
@@ -495,13 +625,23 @@ def main(argv: list[str] | None = None) -> int:
                     f"(listing={listing})"
                 )
             print(
-                f"[{i}/{len(codes)}] {code} listing={listing} "
+                f"[{i}/{len(render_codes)}] {code} listing={listing} "
                 f"window={plot_start}→{end_date}"
             )
             ohlcv = pool._load_ohlcv(pm, code, end_date, train_cutoff=train_cutoff)
+            live = rt.get("live")
+            if live is not None and not getattr(live, "empty", True):
+                from ashare_daily.lib.regime_transition_live_snapshot import (
+                    apply_live_snapshot_to_ohlcv,
+                )
+
+                ohlcv = apply_live_snapshot_to_ohlcv(
+                    ohlcv, live, code=code, as_of=end_date
+                )
             cfg = rt["configs"][code]
             name = rt["name_map"].get(code) or code
             used_incr = False
+            fallback_reason: str | None = None
             if args.incremental_mode == "html" and prev_listing is not None:
                 book = write_book_csvs(
                     pool=pool,
@@ -527,22 +667,34 @@ def main(argv: list[str] | None = None) -> int:
                     extra_trail_years=args.fair_path_extra_trail_years,
                     aev=book.get("aev") or [],
                     display_name=name,
+                    early_marks=book.get("agg_marks") or [],
+                    ed_marks=book.get("ed_marks") or [],
+                    ru_marks=book.get("ru_marks") or [],
+                    switch_side=_newday_switch_side(rt["oos"], code, end_date),
+                    diamonds=_newday_diamonds(rt["rev"], code, end_date),
                     rv20_anchor=rt.get("rv20_anchor"),
                     rv5_anchor=rt.get("rv5_anchor"),
                     nav_last=book.get("nav_last"),
-                    nav_by_date=book.get("nav_by_date"),
+                    seg_df=book.get("seg_df"),
                 )
                 if html_out is not None and reason in {"ok", "same"}:
-                    print(f"[{i}/{len(codes)}] INCREMENT html {code} reason={reason}")
+                    print(f"[{i}/{len(render_codes)}] INCREMENT html {code} reason={reason}")
                     used_incr = True
                     row = dict(book)
-                    row.pop("aev", None)
-                    row.pop("nav_last", None)
-                    row.pop("nav_by_date", None)
+                    for key in (
+                        "aev",
+                        "nav_last",
+                        "agg_marks",
+                        "ed_marks",
+                        "ru_marks",
+                        "seg_df",
+                    ):
+                        row.pop(key, None)
                     row["out"] = html_out.name
                     summary_rows.append(row)
                 else:
-                    print(f"[{i}/{len(codes)}] FALLBACK full {code} reason={reason}")
+                    fallback_reason = reason
+                    print(f"[{i}/{len(render_codes)}] FALLBACK full {code} reason={reason}")
             if not used_incr:
                 r = pool.oos_one(
                     code=code,
@@ -557,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                     evt=rt["evt"],
                     name_map=rt["name_map"],
                     out_dir=out_dir,
-                    live_snapshot=rt["live"],
+                    live_snapshot=None,
                     hrp_mode_by_code=rt["hrp_mode_by_code"],
                     enable_ru_diag=bool(rt["enable_ru_diag"]),
                     enable_shallow_up_trade=bool(rt["enable_shallow_up_trade"]),
@@ -565,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
                     rv5_anchor=rt["rv5_anchor"],
                     fair_path_extra_trail_years=args.fair_path_extra_trail_years,
                 )
+                if fallback_reason:
+                    r["_fallback_reason"] = fallback_reason
                 summary_rows.append(r)
             htmls = list(out_dir.glob(f"regime_transition_{code}_*_adaptive.html"))
             htmls = [
@@ -589,14 +743,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as exc:  # noqa: BLE001
             errors.append(dict(code=code, error=str(exc)))
-            print(f"[{i}/{len(codes)}] FAIL {code}: {exc}")
+            print(f"[{i}/{len(render_codes)}] FAIL {code}: {exc}")
             if args.fail_fast:
                 traceback.print_exc()
                 return 1
 
-    pd.DataFrame(listing_rows).to_csv(
-        out_dir / "listing_dates.csv", index=False, encoding="utf-8-sig"
-    )
+    listing_out = pd.DataFrame(kept_listing_rows + listing_rows)
+    if not listing_out.empty and "code" in listing_out.columns:
+        listing_out["code"] = listing_out["code"].astype(str).str.upper()
+        listing_out = listing_out.drop_duplicates(subset=["code"], keep="last")
+    listing_out.to_csv(out_dir / "listing_dates.csv", index=False, encoding="utf-8-sig")
     if listing_cache_path is not None and listing_rows:
         for row in listing_rows:
             c = str(row.get("code") or "").upper()
@@ -606,7 +762,11 @@ def main(argv: list[str] | None = None) -> int:
         write_listing_cache(listing_cache_path, listing_lookup)
         print(f"[INFO] wrote listing cache n={len(listing_lookup)} -> {listing_cache_path}")
     if summary_rows:
-        pool.write_merged_batch_summary(out_dir, pd.DataFrame(summary_rows))
+        clean_rows = [
+            {k: v for k, v in row.items() if k not in {"_incr_reason", "_fallback_reason"}}
+            for row in summary_rows
+        ]
+        pool.write_merged_batch_summary(out_dir, pd.DataFrame(clean_rows))
     if errors:
         pd.DataFrame(errors).to_csv(
             out_dir / "from_listing_errors.csv", index=False, encoding="utf-8-sig"

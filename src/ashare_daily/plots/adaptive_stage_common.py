@@ -124,7 +124,7 @@ def segments(regime: np.ndarray, dates: np.ndarray, close: np.ndarray) -> pd.Dat
 
 TRUTH_VERSION = "retro_full+causal_confirmed_v1"
 # Bump when METHOD label logic changes (invalidates adaptive config cache).
-METHOD_IMPL_VERSION = "per_code_enter_up_params_v1"
+METHOD_IMPL_VERSION = "strict_vrev_nearstack_v1"
 # Visual-only early marks: ±move from episode peak/trough (does not change labels/trades).
 EARLY_REGIME_MOVE = 0.06
 # When retrospective truth is almost all-range (short listing / no swings),

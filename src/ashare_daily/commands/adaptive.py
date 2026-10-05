@@ -30,7 +30,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--validation-dir", type=Path, default=VALIDATION_DIR)
     p.add_argument("--html-out-dir", type=Path, default=None)
     p.add_argument("--no-ticket-card", action="store_true")
-    p.add_argument("--ru-diag", action="store_true")
+    p.add_argument("--disable-ru-diag", action="store_true")
     p.add_argument("--fair-path-extra-trail-years", default="1,0.5,0.25,1/12")
     return p
 
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         forwarded += ["--train-cache-dir", str(cache)]
     if args.retrain:
         forwarded.append("--retrain")
-    if not args.ru_diag:
+    if args.disable_ru_diag:
         forwarded.append("--disable-ru-diag")
     if args.max_codes:
         forwarded += ["--max-codes", str(args.max_codes)]

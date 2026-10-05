@@ -245,15 +245,46 @@ def load_fund_list_universe(
     return universe, code_name_map
 
 
+def shape_loaded_panels(
+    close: pd.DataFrame,
+    vol: pd.DataFrame,
+    *,
+    ffill: bool = True,
+    excluded_codes: Iterable[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Sort panels and optionally forward-fill close.
+
+    ``ffill=True`` is the production default. The recall auditor passes
+    ``False`` and fills only the 253-row window it clusters.
+    """
+    close = close.sort_index()
+    vol = vol.sort_index()
+    close.index.name = "Date"
+    vol.index.name = "Date"
+    if ffill:
+        close = close.ffill()
+    if excluded_codes:
+        normalized_excluded = build_normalized_code_set(excluded_codes)
+        keep_cols = [c for c in close.columns if not code_in_normalized_set(c, normalized_excluded)]
+        dropped = set(close.columns) - set(keep_cols)
+        if dropped:
+            print(f"Removed {len(dropped)} codes due to exclude-types rule.")
+            close = close[keep_cols]
+            vol = vol[keep_cols]
+    return close, vol
+
+
 def load_data(
     instruments: Iterable[str],
     provider_uri: str,
     test_period: tuple[str, str],
     excluded_codes: Iterable[str] | None = None,
+    ffill: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Pull ``$close`` and ``$volume`` from qlib for ``instruments``.
 
     Mirrors ``2_filter/0.2_cluster_select_from_dendrogram.py::load_data``.
+    ``ffill`` defaults to True so existing callers keep today's filled panel.
     """
     global qlib, D, REG_CN, _QLIB_INIT_PROVIDER_URI
     if qlib is None or D is None or REG_CN is None:
@@ -282,18 +313,7 @@ def load_data(
     )
     close = raw["$close"].unstack(level="instrument")
     vol = raw["$volume"].unstack(level="instrument")
-    close.index.name = "Date"
-    vol.index.name = "Date"
-    close = close.sort_index().ffill()
-    vol = vol.sort_index()
-    if excluded_codes:
-        normalized_excluded = build_normalized_code_set(excluded_codes)
-        keep_cols = [c for c in close.columns if not code_in_normalized_set(c, normalized_excluded)]
-        dropped = set(close.columns) - set(keep_cols)
-        if dropped:
-            print(f"Removed {len(dropped)} codes due to exclude-types rule.")
-            close = close[keep_cols]
-            vol = vol[keep_cols]
+    close, vol = shape_loaded_panels(close, vol, ffill=ffill, excluded_codes=excluded_codes)
     print("Loaded close shape", close.shape, "volume shape", vol.shape)
     return close, vol
 

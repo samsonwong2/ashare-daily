@@ -1,10 +1,8 @@
-"""Reuse the previous from_listing HTML and append each missing causal bar.
+"""Reuse yesterday's from_listing HTML and append one causal bar.
 
-Fair-path OLS and expanding P95 rails are causal in ``t``, so overlapping
-history can be kept when qfq closes match. A one-day gap appends one bar
-(same as the ETF daily run). A longer gap appends each missing trading day
-in order instead of rebuilding the figure. Falls back to a full rebuild
-when the previous HTML is missing or inconsistent.
+Fair-path OLS, expanding P95 rails, and fig7–10 EWMA residual rails are
+causal in ``t``, so overlapping history can be kept when qfq closes match.
+Falls back to a full rebuild when the previous HTML is missing or inconsistent.
 
 Does not change production hold_up method selection.
 """
@@ -235,6 +233,156 @@ def _find_scatter(
     return None
 
 
+def _find_rail(
+    traces: list[dict[str, Any]],
+    *,
+    yaxis: str,
+    hz: str,
+    upper: bool,
+    kind: str,
+) -> dict[str, Any] | None:
+    """P95 vs EWMA rail. ``kind`` is ``p95`` or ``ewma``."""
+    prefix = f"{'上轨' if upper else '下轨'}{hz}"
+    for tr in traces:
+        if str(tr.get("yaxis") or "") != yaxis:
+            continue
+        if tr.get("type") not in (None, "scatter"):
+            continue
+        name = str(tr.get("name") or "")
+        if prefix not in name:
+            continue
+        is_ewma = "EWMA残差轨" in name
+        if kind == "ewma" and is_ewma:
+            return tr
+        if kind == "p95" and not is_ewma:
+            return tr
+    return None
+
+
+def _ewma_rail_hover(
+    upper_v: float,
+    lower_v: float,
+    path_v: float,
+    *,
+    is_upper: bool,
+) -> str:
+    if not (np.isfinite(path_v) and path_v > 0 and np.isfinite(upper_v)):
+        return "上轨(EWMA)=na" if is_upper else "下轨(EWMA)=na"
+    half = float(upper_v) / float(path_v) - 1.0
+    if is_upper:
+        return f"上轨(EWMA 当日{half:+.1%})={upper_v:.4f}"
+    return f"下轨(EWMA 当日{-half:+.1%})={lower_v:.4f}"
+
+
+def _extend_ewma_rail(
+    tr: dict[str, Any],
+    *,
+    x_src: dict[str, Any],
+    y_new: np.ndarray,
+    hovers: list[str],
+) -> None:
+    """Append missing trailing EWMA points so the rail matches path length."""
+    ys = _as_1d_list(tr.get("y"))
+    xs = _as_1d_list(tr.get("x"))
+    x_ref = _as_1d_list(x_src.get("x"))
+    start = len(ys)
+    target = int(len(y_new))
+    if start >= target:
+        return
+    for i in range(start, target):
+        if i < len(x_ref):
+            xs.append(x_ref[i])
+        ys.append(float(y_new[i]) if np.isfinite(y_new[i]) else float("nan"))
+        tr["x"] = xs
+        tr["y"] = ys
+        hover = hovers[i] if i < len(hovers) else "上轨(EWMA)=na"
+        _align_customdata_after_y(tr, hover)
+    tr["x"] = xs
+    tr["y"] = ys
+
+
+def _catch_up_ewma_rails(
+    traces: list[dict[str, Any]],
+    *,
+    yaxis: str,
+    hz: str,
+    path_tr: dict[str, Any],
+    candle_tr: dict[str, Any] | None,
+) -> None:
+    """Extend fig7–10 EWMA rails to the current path length (incl. missed days)."""
+    up_ew = _find_rail(traces, yaxis=yaxis, hz=hz, upper=True, kind="ewma")
+    lo_ew = _find_rail(traces, yaxis=yaxis, hz=hz, upper=False, kind="ewma")
+    if up_ew is None and lo_ew is None:
+        return
+    from ashare_daily.lib.ewma_fair_rails import ewma_scaled_envelope
+
+    path_arr = np.asarray(_as_1d_list(path_tr.get("y")), dtype=float)
+    if candle_tr is not None:
+        close_arr = np.asarray(_as_1d_list(candle_tr.get("close")), dtype=float)
+    else:
+        close_arr = np.full(len(path_arr), np.nan, dtype=float)
+    m = min(len(path_arr), len(close_arr))
+    if m < 2:
+        return
+    eu, el, _delta = ewma_scaled_envelope(
+        pd.Series(path_arr[:m]),
+        pd.Series(close_arr[:m]),
+    )
+    hovers_up: list[str] = []
+    hovers_lo: list[str] = []
+    for i in range(m):
+        uv = float(eu.iloc[i])
+        lv = float(el.iloc[i])
+        pv = float(path_arr[i])
+        hovers_up.append(_ewma_rail_hover(uv, lv, pv, is_upper=True))
+        hovers_lo.append(_ewma_rail_hover(uv, lv, pv, is_upper=False))
+    if up_ew is not None:
+        _extend_ewma_rail(
+            up_ew, x_src=path_tr, y_new=eu.to_numpy(dtype=float)[:m], hovers=hovers_up
+        )
+    if lo_ew is not None:
+        _extend_ewma_rail(
+            lo_ew, x_src=path_tr, y_new=el.to_numpy(dtype=float)[:m], hovers=hovers_lo
+        )
+
+
+def _panel_candle(
+    traces: list[dict[str, Any]], yaxis: str
+) -> dict[str, Any] | None:
+    for tr in traces:
+        if tr.get("type") == "candlestick" and str(tr.get("yaxis") or "") == yaxis:
+            return tr
+    return None
+
+
+def _catch_up_all_ewma_rails(
+    traces: list[dict[str, Any]], trails: list[float]
+) -> int:
+    """Fill short EWMA rails on all trail panels. Returns panels repaired."""
+    n_fixed = 0
+    for years in trails:
+        yax = TRAIL_YAXIS.get(float(years))
+        if yax is None:
+            continue
+        hz = _horizon_label(float(years))
+        path_tr = _find_scatter(traces, yaxis=yax, name_contains="公平路径")
+        if path_tr is None:
+            continue
+        up_ew = _find_rail(traces, yaxis=yax, hz=hz, upper=True, kind="ewma")
+        n_path = len(_as_1d_list(path_tr.get("y")))
+        n_ew = len(_as_1d_list(up_ew.get("y"))) if up_ew is not None else n_path
+        _catch_up_ewma_rails(
+            traces,
+            yaxis=yax,
+            hz=hz,
+            path_tr=path_tr,
+            candle_tr=_panel_candle(traces, yax),
+        )
+        if up_ew is not None and n_ew < n_path:
+            n_fixed += 1
+    return n_fixed
+
+
 def _find_named(
     traces: list[dict[str, Any]],
     *,
@@ -423,6 +571,7 @@ def _fig1_5_last_values(
     rv5_anchor: pd.Series | None = None,
     need_ann_fallback: float | None = None,
     need_ann_5_fallback: float | None = None,
+    erp_ann: float | None = None,
 ) -> dict[str, Any]:
     """Causal last-bar values for fig1–5 overlays (MA / volume / vol / need-gap)."""
     from ashare_daily.lib.regime_transition_plot import compute_volatility_regime_frame
@@ -435,6 +584,7 @@ def _fig1_5_last_values(
     )
 
     out: dict[str, Any] = {}
+    prem = float(ANCHOR_ERP_ANN if erp_ann is None else erp_ann)
     c = pd.to_numeric(close, errors="coerce")
     c.index = pd.DatetimeIndex(pd.to_datetime(c.index)).normalize()
     c = c[~c.index.duplicated(keep="last")].sort_index()
@@ -455,9 +605,9 @@ def _fig1_5_last_values(
     indexed = vf.set_index("as_of")
     need = None
     if rv20_anchor is not None and not getattr(rv20_anchor, "empty", True):
-        need = fair_need_ann_series(indexed["rv20"], rv20_anchor, erp_ann=ANCHOR_ERP_ANN)
+        need = fair_need_ann_series(indexed["rv20"], rv20_anchor, erp_ann=prem)
     if need is None or need.empty or not np.isfinite(float(need.iloc[-1]) if len(need) else float("nan")):
-        fb = need_ann_fallback if need_ann_fallback is not None else ANCHOR_ERP_ANN
+        fb = need_ann_fallback if need_ann_fallback is not None else prem
         need = pd.Series(float(fb), index=c.index, dtype=float)
     need5 = need
     if (
@@ -465,7 +615,7 @@ def _fig1_5_last_values(
         and not getattr(rv5_anchor, "empty", True)
         and "rv5" in indexed.columns
     ):
-        need5_try = fair_need_ann_series(indexed["rv5"], rv5_anchor, erp_ann=ANCHOR_ERP_ANN)
+        need5_try = fair_need_ann_series(indexed["rv5"], rv5_anchor, erp_ann=prem)
         if need5_try is not None and not need5_try.empty:
             need5 = need5_try.reindex(need.index)
     elif need_ann_5_fallback is not None:
@@ -538,6 +688,7 @@ def _append_fig1_5_overlays(
     expected_len: int,
     rv20_anchor: pd.Series | None = None,
     rv5_anchor: pd.Series | None = None,
+    erp_ann: float | None = None,
 ) -> None:
     """Recompute fig1–5 last-bar overlays. Do not copy yesterday's y."""
     from ashare_daily.plots.plot_regime_transition_example import (
@@ -565,8 +716,10 @@ def _append_fig1_5_overlays(
         rv5_anchor=rv5_anchor,
         need_ann_fallback=need_fb,
         need_ann_5_fallback=need5_fb,
+        erp_ann=erp_ann,
     )
-    erp_txt = f"{float(ANCHOR_ERP_ANN):.1%}"
+    prem = float(ANCHOR_ERP_ANN if erp_ann is None else erp_ann)
+    erp_txt = f"{prem:.1%}"
     date_s = pd.Timestamp(new_ts).strftime("%Y-%m-%d")
     rv5_hover = (
         f"日期={date_s}<br>"
@@ -711,6 +864,7 @@ def _patch_trail_path_hover(
     g_new: float,
     g_by: dict[float, float],
     signed_pct: float,
+    ewma_pct: float,
     asset_name: str | None,
 ) -> str:
     from ashare_daily.plots.plot_regime_transition_example import (
@@ -730,11 +884,17 @@ def _patch_trail_path_hover(
     )
     pct_txt = f"相对路径因果分位={_fmt_signed_path_percentile(signed_pct)}"
     s = re.sub(r"相对路径因果分位=[^<]+", pct_txt, s, count=1)
+    ewma_txt = f"相对路径ewma分位={_fmt_signed_path_percentile(ewma_pct)}"
+    if re.search(r"相对路径ewma分位=[^<]+", s):
+        s = re.sub(r"相对路径ewma分位=[^<]+", ewma_txt, s, count=1)
+    else:
+        s = s.replace(pct_txt, f"{pct_txt}<br>{ewma_txt}", 1)
     gap_line = fmt_path_gap_hover_line(asset_name, new_ts, close_new, path_new)
     if re.search(r"<br>[^<]* 约 (?:[+-]\d+%|—)", s):
         s = re.sub(r"<br>[^<]* 约 (?:[+-]\d+%|—)", f"<br>{gap_line}", s, count=1)
     else:
-        s = s.replace(pct_txt, f"{pct_txt}<br>{gap_line}", 1)
+        anchor = ewma_txt if ewma_txt in s else pct_txt
+        s = s.replace(anchor, f"{anchor}<br>{gap_line}", 1)
     for years, g in g_by.items():
         hz = _horizon_label(years)
         s = re.sub(
@@ -756,11 +916,13 @@ def append_fair_path_bar(
     rv20_anchor: pd.Series | None = None,
     rv5_anchor: pd.Series | None = None,
     nav_last: dict[str, float] | None = None,
+    erp_ann: float | None = None,
 ) -> tuple[dict[float, float], dict[float, float]]:
     """Append last-bar path/rails/candles. Returns g and delta by trail years."""
     from ashare_daily.plots.plot_regime_transition_example import (
         _trail_fit_min_bars,
         causal_path_residual_signed_percentile,
+        ewma_path_residual_signed_percentile,
     )
 
     px_new = float(ohlcv_last["$close"])
@@ -796,8 +958,8 @@ def append_fair_path_bar(
         g_by[float(years)] = g_new
         hz = _horizon_label(float(years))
         path_tr = _find_scatter(traces, yaxis=yax, name_contains="公平路径")
-        up_tr = _find_scatter(traces, yaxis=yax, name_contains=f"上轨{hz}")
-        lo_tr = _find_scatter(traces, yaxis=yax, name_contains=f"下轨{hz}")
+        up_tr = _find_rail(traces, yaxis=yax, hz=hz, upper=True, kind="p95")
+        lo_tr = _find_rail(traces, yaxis=yax, hz=hz, upper=False, kind="p95")
         if path_tr is None:
             continue
         path_hist = np.asarray(_as_1d_list(path_tr.get("y")), dtype=float)
@@ -827,6 +989,13 @@ def append_fair_path_bar(
         if lo_tr is not None:
             _append_new_x(lo_tr, new_ts)
             _append_scalar(lo_tr, "y", lower)
+        _catch_up_ewma_rails(
+            traces,
+            yaxis=yax,
+            hz=hz,
+            path_tr=path_tr,
+            candle_tr=c_tr,
+        )
 
     for years in trails:
         yax = TRAIL_YAXIS.get(float(years))
@@ -857,6 +1026,11 @@ def append_fair_path_bar(
             min_bars=_trail_fit_min_bars(float(years)),
         )
         last_pct = float(signed.iloc[-1]) if len(signed) else float("nan")
+        ewma_signed = ewma_path_residual_signed_percentile(
+            pd.Series(path_arr[:n]),
+            pd.Series(close_arr[:n]),
+        )
+        last_ewma = float(ewma_signed.iloc[-1]) if len(ewma_signed) else float("nan")
         g_this = float(g_by.get(float(years), float("nan")))
         new_hover = _patch_trail_path_hover(
             _customdata_text(cd[-1]),
@@ -866,6 +1040,7 @@ def append_fair_path_bar(
             g_new=g_this,
             g_by=g_by,
             signed_pct=last_pct,
+            ewma_pct=last_ewma,
             asset_name=asset_name,
         )
         _append_customdata(path_tr, new_hover)
@@ -888,6 +1063,7 @@ def append_fair_path_bar(
             expected_len=int(overlay_len),
             rv20_anchor=rv20_anchor,
             rv5_anchor=rv5_anchor,
+            erp_ann=erp_ann,
         )
         _append_fig6_nav(
             traces,
@@ -898,62 +1074,489 @@ def append_fair_path_bar(
     return g_by, d_by
 
 
+_TRADE_STYLES = {
+    "up": dict(bc="#12a150", bl="#064d1f", sc="#d62728", sl="#6b1010", bn="上涨买", sn="上涨卖"),
+    "down": dict(bc="#2ca02c", bl="#145214", sc="#ff7f0e", sl="#8c4500", bn="下跌买", sn="下跌卖"),
+    "range": dict(bc="#1f77b4", bl="#0b3d5c", sc="#9467bd", sl="#4b2e66", bn="横盘买", sn="横盘卖"),
+}
+
+
 def _add_trade_markers(
     traces: list[dict[str, Any]],
     *,
     aev: list[dict[str, Any]],
     new_date: str,
     ohlcv_last: pd.Series,
-    layout: dict[str, Any],
+    prev_close: pd.Series | None = None,
 ) -> None:
-    from ashare_daily.plots.overlay_oracle_pivots_on_regime_html import (
-        FIG_PANEL_AXES,
-        _panel_rail_ys,
-        _rail_ys,
-    )
+    """Append same-day B/S to fig1 only, reusing full-build names/styles.
 
+    Full build (``annotate_figure``) draws 上涨买/上涨卖 with B/S text on the
+    price panel only; incremental must match — no ``+`` names, no fig2-11 copies.
+    """
     new_ev = [e for e in aev if str(e.get("date")) == new_date]
     if not new_ev:
         return
-    dummy = pd.DataFrame(
-        {
-            "$high": [float(ohlcv_last["$high"])],
-            "$low": [float(ohlcv_last["$low"])],
-        }
-    )
-    ra, rb = _rail_ys(dummy)
-    buys = [e for e in new_ev if str(e.get("side")) == "BUY"]
-    sells = [e for e in new_ev if str(e.get("side")) == "SELL"]
+    hi = float(ohlcv_last["$high"])
+    lo = float(ohlcv_last["$low"])
+    span = max(hi - lo, 1e-6)
+    if prev_close is not None:
+        pc = pd.to_numeric(prev_close, errors="coerce").dropna()
+        if len(pc):
+            span = max(float(pc.max() - pc.min()), 1e-6)
+    off = span * 0.035
     ts = pd.Timestamp(new_date)
+    for e in new_ev:
+        st = _TRADE_STYLES.get(str(e.get("regime") or "up"), _TRADE_STYLES["up"])
+        is_buy = str(e.get("side")) == "BUY"
+        px = float(e.get("px", np.nan))
+        if is_buy:
+            hover = f"买 {new_date}<br>{e.get('why', '')}<br>价={px:.3f}"
+            _append_or_create_marker(
+                traces, name=st["bn"], x_ts=ts, y=lo - off,
+                symbol="triangle-up", color=st["bc"], line_color=st["bl"],
+                size=14, line_width=1.2, text="B", hover=hover,
+                textposition="bottom center",
+            )
+        else:
+            ret = e.get("fwd_ret")
+            ret_s = f"<br>收益={float(ret):+.1%}" if ret is not None and pd.notna(ret) else ""
+            hover = f"卖 {new_date}<br>{e.get('why', '')}<br>价={px:.3f}{ret_s}"
+            _append_or_create_marker(
+                traces, name=st["sn"], x_ts=ts, y=hi + off,
+                symbol="triangle-down", color=st["sc"], line_color=st["sl"],
+                size=14, line_width=1.2, text="S", hover=hover,
+                textposition="top center",
+            )
 
-    def _mk(side: str, y: float, yaxis: str, xaxis: str, showlegend: bool) -> dict[str, Any]:
-        is_buy = side == "BUY"
-        return dict(
-            type="scatter",
-            x=[ts],
-            y=[y],
-            mode="markers",
-            name=("上涨买+" if is_buy else "上涨卖+") if showlegend else None,
-            marker=dict(
-                symbol="triangle-up" if is_buy else "triangle-down",
-                size=12,
-                color="#12a150" if is_buy else "#d62728",
-            ),
-            yaxis=yaxis,
-            xaxis=xaxis,
-            showlegend=showlegend,
+
+def _trace_x_append(tr: dict[str, Any], x_ts: pd.Timestamp) -> None:
+    """Append x keeping the trace's existing encoding (str date vs epoch ms)."""
+    xs = _as_1d_list(tr.get("x"))
+    if xs and isinstance(xs[0], (int, float)) and not isinstance(xs[0], bool):
+        xs.append(int(x_ts.value // 10**6))
+    else:
+        xs.append(x_ts.strftime("%Y-%m-%d"))
+    tr["x"] = xs
+
+
+def _append_or_create_marker(
+    traces: list[dict[str, Any]],
+    *,
+    name: str,
+    x_ts: pd.Timestamp,
+    y: float,
+    symbol: str,
+    color: str,
+    line_color: str,
+    size: float,
+    line_width: float,
+    text: str | None = None,
+    hover: str | None = None,
+    rail_y: float | None = None,
+    textposition: str | None = None,
+) -> None:
+    """Append a point to the existing fig1 trace named ``name`` or create it.
+
+    Rail traces (switch triangles / confirmation diamonds) keep their constant
+    y so the in-HTML rail re-racking JS still treats them as rails.
+    """
+    for tr in traces:
+        if str(tr.get("name") or "") != name:
+            continue
+        if str(tr.get("yaxis") or "y") not in {"y", "y1"}:
+            continue
+        _trace_x_append(tr, x_ts)
+        ys = _as_1d_list(tr.get("y"))
+        ys.append(float(rail_y if rail_y is not None else y))
+        tr["y"] = ys
+        if "text" in tr:
+            tv = _as_1d_list(tr.get("text"))
+            tv.append(text if text is not None else "")
+            tr["text"] = tv
+        if "hovertext" in tr:
+            hv = _as_1d_list(tr.get("hovertext"))
+            hv.append(hover or "")
+            tr["hovertext"] = hv
+        if "customdata" in tr:
+            cv = _as_1d_list(tr.get("customdata"))
+            cv.append(hover or "")
+            tr["customdata"] = cv
+        return
+    tr: dict[str, Any] = dict(
+        type="scatter",
+        x=[x_ts.strftime("%Y-%m-%d")],
+        y=[float(rail_y if rail_y is not None else y)],
+        mode="markers+text" if text else "markers",
+        name=name,
+        marker=dict(
+            symbol=symbol,
+            size=size,
+            color=color,
+            line=dict(width=line_width, color=line_color),
+        ),
+        yaxis="y",
+        xaxis="x",
+        showlegend=True,
+        cliponaxis=False,
+    )
+    if text:
+        tr["text"] = [text]
+        tr["textposition"] = textposition or "top center"
+        tr["textfont"] = dict(size=10, color=line_color, family="Arial Black")
+    if hover:
+        tr["hovertext"] = [hover]
+        tr["hoverinfo"] = "text"
+    traces.append(tr)
+
+
+# Styles mirror annotate_figure / overlay_marker_specs (full build).
+_EARLY_STYLES = {
+    "leave_down": dict(name="提前离↓(V)", text="V", color="#e67e22", line="#8a4b08", side="buy"),
+    "enter_up": dict(name="提前进↑", text="↑", color="#27ae60", line="#145a32", side="buy"),
+    "leave_up": dict(name="提前离↑(X)", text="X", color="#8e44ad", line="#4a235a", side="sell"),
+    "enter_down": dict(name="提前进↓", text="↓", color="#c0392b", line="#7b241c", side="sell"),
+}
+_ED_STYLES = {
+    "ed_alert": dict(name="ED告警(模型滞后)", color="#c0392b", line="#641e16"),
+    "ed_watch": dict(name="ED观察(已对齐↓)", color="#7f8c8d", line="#2c3e50"),
+}
+_RU_STYLE = dict(name="RU恢复上涨(诊断)", color="#1abc9c", line="#0e6655")
+_SWITCH_STYLES = {
+    "up": dict(name="上行切换", symbol="triangle-up", color="#2ca02c"),
+    "down": dict(name="下行切换", symbol="triangle-down", color="#d62728"),
+}
+_DIAMOND_STYLES = {
+    "early_reversal_bottom": dict(name="早期底反确认(T+3)", color="#9ecae1", side="buy"),
+    "early_reversal_top": dict(name="早期顶反确认(T+3)", color="#fdae6b", side="sell"),
+    "final_reversal_bottom": dict(name="最终底反确认(T+10)", color="#1f77b4", side="buy"),
+    "final_reversal_top": dict(name="最终顶反确认(T+10)", color="#ff7f0e", side="sell"),
+    "reversal_revoked": dict(name="早期确认已撤销", color="#7f7f7f", side="sell"),
+}
+
+
+def _add_newday_overlay_markers(
+    traces: list[dict[str, Any]],
+    *,
+    new_date: str,
+    ohlcv_last: pd.Series,
+    prev_close: pd.Series,
+    early_marks: list[dict[str, Any]] | None,
+    ed_marks: list[dict[str, Any]] | None,
+    ru_marks: list[dict[str, Any]] | None,
+    switch_side: str | None,
+    diamonds: list[dict[str, Any]] | None,
+) -> None:
+    """Draw fig1 overlay markers that fire on the incremental new day.
+
+    Full build draws these from the overlay/adaptive pipeline; incremental mode
+    previously appended only B/S trades, so same-day triangles / early marks /
+    ED / RU / confirmation diamonds were silently missing.
+    """
+    ts = pd.Timestamp(new_date)
+    hi = float(ohlcv_last["$high"])
+    lo = float(ohlcv_last["$low"])
+    pc = pd.to_numeric(prev_close, errors="coerce").dropna()
+    span = max(float(pc.max() - pc.min()), 1e-6) if len(pc) else max(hi - lo, 1e-6)
+    off = span * 0.035
+    y_buy, y_sell = lo - off, hi + off
+
+    for m in early_marks or []:
+        if str(m.get("date")) != new_date:
+            continue
+        st = _EARLY_STYLES.get(str(m.get("kind") or ""))
+        if st is None:
+            continue
+        mv = m.get("move", np.nan)
+        mv_s = f"{float(mv):+.1%}" if pd.notna(mv) else "?"
+        hover = (
+            f"{st['name']} {new_date}<br>变动{mv_s}（非交易信号）"
+            f"<br>价={float(m.get('px', np.nan)):.3f}<br>{m.get('why', '')}"
+        )
+        _append_or_create_marker(
+            traces, name=st["name"], x_ts=ts,
+            y=y_buy if st["side"] == "buy" else y_sell,
+            symbol="diamond-open", color=st["color"], line_color=st["line"],
+            size=13, line_width=2.0, text=str(m.get("symbol") or st["text"]),
+            hover=hover,
         )
 
-    if buys:
-        traces.append(_mk("BUY", ra, "y", "x", True))
-    if sells:
-        traces.append(_mk("SELL", rb, "y", "x", True))
-    for _panel, yaxis, xaxis in FIG_PANEL_AXES:
-        pra, prb = _panel_rail_ys(traces, yaxis, layout)
-        if buys:
-            traces.append(_mk("BUY", pra, yaxis, xaxis, False))
-        if sells:
-            traces.append(_mk("SELL", prb, yaxis, xaxis, False))
+    for m in ed_marks or []:
+        if str(m.get("date")) != new_date:
+            continue
+        st = _ED_STYLES.get(str(m.get("kind") or ""))
+        if st is None:
+            continue
+        end_s = str(m.get("end") or new_date)
+        hover = (
+            f"{st['name']} {new_date}→{end_s}<br>"
+            f"n={int(m.get('n_bars') or 1)} · regime={m.get('regime')}<br>"
+            f"reasons={m.get('reasons') or '—'}<br>{m.get('why', '')}<br>诊断层·不改买卖"
+        )
+        _append_or_create_marker(
+            traces, name=st["name"], x_ts=ts, y=y_sell + span * 0.01,
+            symbol="hexagon", color=st["color"], line_color=st["line"],
+            size=14, line_width=1.5, text=str(m.get("symbol") or "ED"),
+            hover=hover,
+        )
+
+    for m in ru_marks or []:
+        if str(m.get("date")) != new_date:
+            continue
+        end_s = str(m.get("end") or new_date)
+        hover = (
+            f"{_RU_STYLE['name']} {new_date}→{end_s}<br>"
+            f"n={int(m.get('n_bars') or 1)} · regime={m.get('regime')}<br>"
+            f"reasons={m.get('reasons') or '—'}<br>{m.get('why', '')}<br>诊断双通道·不改买卖"
+        )
+        _append_or_create_marker(
+            traces, name=_RU_STYLE["name"], x_ts=ts, y=y_sell + span * 0.01,
+            symbol="diamond", color=_RU_STYLE["color"], line_color=_RU_STYLE["line"],
+            size=14, line_width=1.5, text=str(m.get("symbol") or "RU"),
+            hover=hover,
+        )
+
+    if switch_side in _SWITCH_STYLES:
+        st = _SWITCH_STYLES[switch_side]
+        _append_or_create_marker(
+            traces, name=st["name"], x_ts=ts,
+            y=y_sell if switch_side == "up" else y_buy,
+            symbol=st["symbol"], color=st["color"], line_color="#222",
+            size=16, line_width=1.5,
+            hover=f"日期={new_date}<br>动作={'上行分位切换' if switch_side == 'up' else '下行分位切换'}",
+        )
+
+    for d in diamonds or []:
+        kind = str(d.get("reversal_marker") or "")
+        st = _DIAMOND_STYLES.get(kind)
+        if st is None:
+            continue
+        _append_or_create_marker(
+            traces, name=st["name"], x_ts=ts,
+            y=y_buy if st["side"] == "buy" else y_sell,
+            symbol="diamond-open", color=st["color"], line_color="#222",
+            size=16, line_width=1.5,
+            hover=str(d.get("hover") or ""),
+        )
+
+
+# Fig1 background fills — keep in lockstep with adaptive_stage_common.apply_adaptive_overlays.
+FIG1_REGIME_FILL = {
+    "up": "rgba(18,161,80,0.12)",
+    "down": "rgba(214,39,40,0.10)",
+    "range": "rgba(148,148,148,0.14)",
+}
+_FIG1_ED_FILL = {
+    "ed_alert": "rgba(192,57,43,0.10)",
+    "ed_watch": "rgba(127,140,141,0.08)",
+}
+_FIG1_ED_LINE = {
+    "ed_alert": "#641e16",
+    "ed_watch": "#2c3e50",
+}
+_FIG1_RU_FILL = "rgba(26,188,156,0.12)"
+_FIG1_RU_LINE = "#0e6655"
+_FIG1_REGIME_FILLS = frozenset(FIG1_REGIME_FILL.values())
+_FIG1_ED_RU_FILLS = frozenset(_FIG1_ED_FILL.values()) | {_FIG1_RU_FILL}
+
+
+def _shape_day(v: Any) -> str:
+    return pd.Timestamp(v).strftime("%Y-%m-%d")
+
+
+def _is_fig1_price_rect(shape: Any) -> bool:
+    if not isinstance(shape, dict):
+        return False
+    if str(shape.get("type") or "rect") != "rect":
+        return False
+    yref = str(shape.get("yref") or "y")
+    xref = str(shape.get("xref") or "x")
+    return yref in {"y", "y1"} and xref in {"x", "x1"}
+
+
+def _is_fig1_regime_rect(shape: Any) -> bool:
+    return _is_fig1_price_rect(shape) and str(shape.get("fillcolor") or "") in _FIG1_REGIME_FILLS
+
+
+def _is_fig1_ed_ru_rect(shape: Any) -> bool:
+    return _is_fig1_price_rect(shape) and str(shape.get("fillcolor") or "") in _FIG1_ED_RU_FILLS
+
+
+def _fig1_band_y(ohlcv: pd.DataFrame, old_shapes: list[Any]) -> tuple[float, float]:
+    lo = hi = float("nan")
+    if "$low" in ohlcv.columns and "$high" in ohlcv.columns:
+        lows = pd.to_numeric(ohlcv["$low"], errors="coerce")
+        highs = pd.to_numeric(ohlcv["$high"], errors="coerce")
+        if len(lows):
+            lo = float(lows.min())
+        if len(highs):
+            hi = float(highs.max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        ys0 = [s.get("y0") for s in old_shapes if _is_fig1_regime_rect(s)]
+        ys1 = [s.get("y1") for s in old_shapes if _is_fig1_regime_rect(s)]
+        if ys0 and ys1:
+            return float(ys0[0]), float(ys1[0])
+        return 0.0, 1.0
+    span = max(hi - lo, 1e-6)
+    return lo - span * 0.02, hi + span * 0.05
+
+
+def _fig1_rect(
+    *,
+    start: Any,
+    end: Any,
+    fillcolor: str,
+    y0: float,
+    y1: float,
+    line: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return dict(
+        type="rect",
+        xref="x",
+        yref="y",
+        x0=_shape_day(start),
+        x1=_shape_day(end),
+        y0=y0,
+        y1=y1,
+        fillcolor=fillcolor,
+        line=line if line is not None else dict(width=0),
+        layer="below",
+    )
+
+
+def _clip_span(
+    start: Any,
+    end: Any,
+    *,
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    ts0, ts1 = pd.Timestamp(start), pd.Timestamp(end)
+    if start_date:
+        ts0 = max(ts0, pd.Timestamp(start_date))
+    if end_date:
+        ts1 = min(ts1, pd.Timestamp(end_date))
+    if ts1 < ts0:
+        return None
+    return ts0, ts1
+
+
+def sync_fig1_regime_shapes(
+    layout: dict[str, Any],
+    *,
+    seg_df: pd.DataFrame | None,
+    ohlcv: pd.DataFrame,
+    ed_marks: list[dict[str, Any]] | None = None,
+    ru_marks: list[dict[str, Any]] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> bool:
+    """Rewrite fig1 涨跌/横盘 (and ED/RU) rects from the current book.
+
+    Incremental HTML copies yesterday's ``layout.shapes``. Without this the
+    last regime band stays frozen at the last full-rebuild date.
+    """
+    if seg_df is None or getattr(seg_df, "empty", True):
+        return False
+    old = list(layout.get("shapes") or [])
+    y0, y1 = _fig1_band_y(ohlcv, old)
+    rebuild_bands = ed_marks is not None or ru_marks is not None
+    kept: list[Any] = []
+    for s in old:
+        if _is_fig1_regime_rect(s):
+            continue
+        if rebuild_bands and _is_fig1_ed_ru_rect(s):
+            continue
+        kept.append(s)
+    new_rects: list[dict[str, Any]] = []
+    for _, row in seg_df.iterrows():
+        fill = FIG1_REGIME_FILL.get(str(row.get("regime") or ""))
+        if fill is None:
+            continue
+        span = _clip_span(
+            row.get("start"), row.get("end"), start_date=start_date, end_date=end_date
+        )
+        if span is None:
+            continue
+        new_rects.append(
+            _fig1_rect(start=span[0], end=span[1], fillcolor=fill, y0=y0, y1=y1)
+        )
+    if rebuild_bands:
+        for m in ed_marks or []:
+            kind = str(m.get("kind") or "ed_alert")
+            fill = _FIG1_ED_FILL.get(kind) or _FIG1_ED_FILL["ed_alert"]
+            line_c = _FIG1_ED_LINE.get(kind) or _FIG1_ED_LINE["ed_alert"]
+            d0 = m.get("date") or ""
+            d1 = m.get("end") or d0
+            span = _clip_span(d0, d1, start_date=start_date, end_date=end_date)
+            if span is None:
+                continue
+            new_rects.append(
+                _fig1_rect(
+                    start=span[0],
+                    end=span[1],
+                    fillcolor=fill,
+                    y0=y0,
+                    y1=y1,
+                    line=dict(width=1.0, color=line_c, dash="dot"),
+                )
+            )
+        for m in ru_marks or []:
+            d0 = m.get("date") or ""
+            d1 = m.get("end") or d0
+            span = _clip_span(d0, d1, start_date=start_date, end_date=end_date)
+            if span is None:
+                continue
+            new_rects.append(
+                _fig1_rect(
+                    start=span[0],
+                    end=span[1],
+                    fillcolor=_FIG1_RU_FILL,
+                    y0=y0,
+                    y1=y1,
+                    line=dict(width=1.0, color=_FIG1_RU_LINE, dash="dot"),
+                )
+            )
+    new_shapes = kept + new_rects
+    old_regime_x1 = [
+        _shape_day(s.get("x1"))
+        for s in old
+        if _is_fig1_regime_rect(s)
+    ]
+    new_regime_x1 = [
+        _shape_day(s.get("x1"))
+        for s in new_rects
+        if str(s.get("fillcolor") or "") in _FIG1_REGIME_FILLS
+    ]
+    changed = (max(old_regime_x1, default="") != max(new_regime_x1, default="")) or (
+        len(old_regime_x1) != len(new_regime_x1)
+    )
+    if rebuild_bands:
+        old_band_n = sum(1 for s in old if _is_fig1_ed_ru_rect(s))
+        new_band_n = sum(
+            1 for s in new_rects if str(s.get("fillcolor") or "") in _FIG1_ED_RU_FILLS
+        )
+        if old_band_n != new_band_n:
+            changed = True
+        else:
+            old_band_x1 = max(
+                (_shape_day(s.get("x1")) for s in old if _is_fig1_ed_ru_rect(s)),
+                default="",
+            )
+            new_band_x1 = max(
+                (
+                    _shape_day(s.get("x1"))
+                    for s in new_rects
+                    if str(s.get("fillcolor") or "") in _FIG1_ED_RU_FILLS
+                ),
+                default="",
+            )
+            if old_band_x1 != new_band_x1:
+                changed = True
+    if not changed:
+        return False
+    layout["shapes"] = new_shapes
+    return True
 
 
 def try_incremental_html(
@@ -970,7 +1573,13 @@ def try_incremental_html(
     rv20_anchor: pd.Series | None = None,
     rv5_anchor: pd.Series | None = None,
     nav_last: dict[str, float] | None = None,
-    nav_by_date: dict[str, dict[str, float]] | None = None,
+    erp_ann: float | None = None,
+    early_marks: list[dict[str, Any]] | None = None,
+    ed_marks: list[dict[str, Any]] | None = None,
+    ru_marks: list[dict[str, Any]] | None = None,
+    switch_side: str | None = None,
+    diamonds: list[dict[str, Any]] | None = None,
+    seg_df: pd.DataFrame | None = None,
 ) -> tuple[Path | None, str]:
     """Patch yesterday HTML. Returns (out_path, reason). reason ok|same|*fallback*."""
     prev = find_listing_html(prev_dir, code)
@@ -1006,73 +1615,75 @@ def try_incremental_html(
         return None, "missing_panels"
 
     prev_last = pd.Timestamp(prev_close.index.max()).normalize()
-    after = new_close.index[new_close.index > prev_last]
+    gap = classify_date_gap(prev_last, new_close.index)
     safe = (display_name or code).replace("/", "")
     start_in_name = prev.name.split("_")
     # regime_transition_CODE_NAME_START_END_adaptive.html — keep start from prev
     out_name = bump_html_end_tag(prev.name, end_date)
     out_path = out_dir / out_name
+    plot_start = pd.to_datetime(work["datetime"]).min().strftime("%Y-%m-%d")
 
-    if len(after) == 0:
+    def _sync_fig1_shapes() -> bool:
+        return sync_fig1_regime_shapes(
+            layout,
+            seg_df=seg_df,
+            ohlcv=work,
+            ed_marks=ed_marks,
+            ru_marks=ru_marks,
+            start_date=plot_start,
+            end_date=end_date,
+        )
+
+    if gap == "same":
+        changed = _catch_up_all_ewma_rails(traces, trails)
+        changed = _sync_fig1_shapes() or changed
+        if changed:
+            fig = go.Figure(data=traces, layout=layout)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            write_adaptive_html(fig, out_path)
+            return out_path, "ok"
         shutil.copy2(prev, out_path)
         return out_path, "same"
+    if gap != "plus_one":
+        return None, gap
 
+    new_ts = pd.Timestamp(new_close.index[-1]).normalize()
     ohlcv = work.copy()
     ohlcv["_d"] = pd.to_datetime(ohlcv["datetime"]).dt.normalize()
-    g_by: dict[float, float] = {}
-    d_by: dict[float, float] = {}
-    print(
-        f"[incr] {code} append_bars={len(after)} "
-        f"{prev_last.date()} -> {pd.Timestamp(after[-1]).date()}"
+    last_row = ohlcv.loc[ohlcv["_d"].eq(new_ts)].iloc[-1]
+    g_by, d_by = append_fair_path_bar(
+        traces,
+        close=new_close,
+        ohlcv_last=last_row,
+        new_ts=new_ts,
+        trails=trails,
+        asset_name=display_name,
+        rv20_anchor=rv20_anchor,
+        rv5_anchor=rv5_anchor,
+        nav_last=nav_last,
+        erp_ann=erp_ann,
     )
-    for raw_ts in after:
-        new_ts = pd.Timestamp(raw_ts).normalize()
-        day_rows = ohlcv.loc[ohlcv["_d"].eq(new_ts)]
-        if day_rows.empty:
-            return None, "missing_bar"
-        last_row = day_rows.iloc[-1]
-        # OLS must be evaluated at this bar, not at the series end.
-        close_upto = new_close.loc[:new_ts]
-        day_key = new_ts.strftime("%Y-%m-%d")
-        if nav_by_date is not None:
-            day_nav = nav_by_date.get(day_key) or {
-                "hold_up净值": float("nan"),
-                "BH净值": float("nan"),
-                "cash净值": float("nan"),
-                "nav_policy": float("nan"),
-            }
-        elif new_ts == pd.Timestamp(after[-1]).normalize():
-            day_nav = nav_last
-        else:
-            day_nav = {
-                "hold_up净值": float("nan"),
-                "BH净值": float("nan"),
-                "cash净值": float("nan"),
-                "nav_policy": float("nan"),
-            }
-        g_by, d_by = append_fair_path_bar(
+    _update_title_g(layout, g_by, d_by)
+    if aev:
+        _add_trade_markers(
             traces,
-            close=close_upto,
+            aev=aev,
+            new_date=new_ts.strftime("%Y-%m-%d"),
             ohlcv_last=last_row,
-            new_ts=new_ts,
-            trails=trails,
-            asset_name=display_name,
-            rv20_anchor=rv20_anchor,
-            rv5_anchor=rv5_anchor,
-            nav_last=day_nav,
+            prev_close=prev_close,
         )
-        _update_title_g(layout, g_by, d_by)
-        if aev:
-            _add_trade_markers(
-                traces,
-                aev=aev,
-                new_date=new_ts.strftime("%Y-%m-%d"),
-                ohlcv_last=last_row,
-                layout=layout,
-            )
-    from ashare_daily.lib.ewma_fair_rails import attach_ewma_rails
-
-    traces = attach_ewma_rails(traces)
+    _add_newday_overlay_markers(
+        traces,
+        new_date=new_ts.strftime("%Y-%m-%d"),
+        ohlcv_last=last_row,
+        prev_close=prev_close,
+        early_marks=early_marks,
+        ed_marks=ed_marks,
+        ru_marks=ru_marks,
+        switch_side=switch_side,
+        diamonds=diamonds,
+    )
+    _sync_fig1_shapes()
     fig = go.Figure(data=traces, layout=layout)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_adaptive_html(fig, out_path)
@@ -1176,21 +1787,15 @@ def write_book_csvs(
     policy_frame = policy_frame[
         (policy_frame["as_of"] >= lo) & (policy_frame["as_of"] <= hi)
     ]
-    def _nav_row(row: pd.Series) -> dict[str, float]:
-        return {
-            "hold_up净值": float(row.get("nav_hold_up", float("nan"))),
-            "BH净值": float(row.get("nav_bh", float("nan"))),
-            "cash净值": float(row.get("nav_cash", float("nan"))),
-            "nav_policy": float(row.get("nav_policy", float("nan"))),
-        }
-
     nav_last: dict[str, float] = {}
-    nav_by_date: dict[str, dict[str, float]] = {}
     if not policy_frame.empty:
-        nav_last = _nav_row(policy_frame.iloc[-1])
-        for _, row in policy_frame.iterrows():
-            day = pd.Timestamp(row["as_of"]).strftime("%Y-%m-%d")
-            nav_by_date[day] = _nav_row(row)
+        last_nav = policy_frame.iloc[-1]
+        nav_last = {
+            "hold_up净值": float(last_nav.get("nav_hold_up", float("nan"))),
+            "BH净值": float(last_nav.get("nav_bh", float("nan"))),
+            "cash净值": float(last_nav.get("nav_cash", float("nan"))),
+            "nav_policy": float(last_nav.get("nav_policy", float("nan"))),
+        }
     agg_marks = detect_early_regime_marks(px_w, regimes=px_w.regime.to_numpy())
     ed_marks = detect_early_down_marks(px_w, regimes=px_w.regime.to_numpy())
     ru_marks: list[dict] = []
@@ -1280,5 +1885,8 @@ def write_book_csvs(
         baseline_regime_diff=baseline_diff,
         aev=aev,
         nav_last=nav_last,
-        nav_by_date=nav_by_date,
+        agg_marks=agg_marks,
+        ed_marks=ed_marks,
+        ru_marks=ru_marks,
+        seg_df=seg_df,
     )

@@ -98,7 +98,7 @@ def listing_worker_prefix(python: str) -> list[str]:
     return [python, "-m", "ashare_daily.plots.plot_adaptive_from_listing"]
 
 
-_LISTING_DIR_NAME = re.compile(r"^(\d{8})_from_listing_stock$")
+_LISTING_DIR_NAME = re.compile(r"^(\d{8})_from_listing(?:_stock)?$")
 
 
 def as_of_from_listing_dir(path: Path) -> str:
@@ -129,8 +129,9 @@ def resolve_listing_dir(raw: str, plotly_root: str | None = None) -> Path:
     path = Path(text)
     if path.is_dir():
         return path
-    if root and _LISTING_DIR_NAME.match(path.name):
-        candidate = Path(root) / path.name
+    match = _LISTING_DIR_NAME.match(path.name)
+    if root and match:
+        candidate = Path(root) / f"{match.group(1)}_from_listing_stock"
         if candidate.is_dir():
             return candidate
     return path

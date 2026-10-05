@@ -58,7 +58,6 @@ from ashare_daily.lib.regime_transition_live_snapshot import (
     load_live_snapshot,
     snapshot_meta,
 )
-from ashare_daily.lib.price_adjustments import auto_qfq_adjust_close_panel
 from ashare_daily.lib.strategy_layer_audit import load_qlib_close
 from ashare_daily.paths import CLUSTER_MAPPING_SELECTED_TXT, FUND_LIST_CSV, QLIB_PROVIDER_URI, repo_root
 
@@ -259,6 +258,57 @@ def run_month_symbol_rows(
             }
         )
     return rows
+
+
+def _build_elig_by_day(
+    audit,
+    days: pd.DatetimeIndex,
+    panel: pd.DataFrame,
+    *,
+    min_history: int,
+    min_valid_in_20: int,
+) -> dict[pd.Timestamp, set[str]]:
+    """Cache eligible universe per day (avoids O(n_codes²) rescans)."""
+    return {
+        d: set(
+            eligible_codes_on_date(
+                audit,
+                d,
+                panel,
+                min_history=min_history,
+                min_valid_in_20=min_valid_in_20,
+            )
+        )
+        for d in days
+    }
+
+
+def _score_month_symbol(
+    code: str,
+    close: pd.Series,
+    eligible_day_strs: list[str],
+    model: FrozenRegimeTransitionModel,
+    cfg: RegimeTransitionConfig,
+    *,
+    horizon: int,
+    kappa_ret: float,
+    kappa_eff: float,
+    kappa_mae: float,
+) -> list[dict[str, Any]]:
+    if not eligible_day_strs:
+        return []
+    days = pd.DatetimeIndex(eligible_day_strs)
+    return run_month_symbol_rows(
+        code,
+        close,
+        days,
+        model,
+        cfg,
+        horizon=horizon,
+        kappa_ret=kappa_ret,
+        kappa_eff=kappa_eff,
+        kappa_mae=kappa_mae,
+    )
 
 
 def _apply_calibration_and_signals(
@@ -886,54 +936,57 @@ def run_regime_transition_validation(
 
         shard_path = shard_dir / f"{month}.signals.csv" if shard_dir else None
         done_marker = shard_dir / f"{month}.done" if shard_dir else None
-        if (
-            resume
-            and shard_path is not None
-            and done_marker is not None
-            and shard_path.exists()
-            and done_marker.exists()
-        ):
-            frame = pd.read_csv(shard_path)
-            all_month_frames.append(frame)
-            continue
-
-        # Day-level resume: keep prior days in shard, only score as_of > last kept day.
         existing_frame: pd.DataFrame | None = None
-        score_days = days
-        if (
-            resume
-            and shard_path is not None
-            and shard_path.exists()
-            and (done_marker is None or not done_marker.exists())
-        ):
+        present_codes: set[str] = set()
+        if resume and shard_path is not None and shard_path.exists():
             try:
                 existing_frame = pd.read_csv(shard_path)
             except Exception as exc:  # noqa: BLE001
-                print(f"[WARN] month={month} failed to read shard for day-resume: {exc}")
+                print(f"[WARN] month={month} failed to read shard for resume: {exc}")
                 existing_frame = None
-            if (
-                existing_frame is not None
-                and not existing_frame.empty
-                and "as_of" in existing_frame.columns
-            ):
-                last = pd.to_datetime(existing_frame["as_of"]).max()
-                score_days = days[days > last]
-                print(
-                    f"[INFO] month={month} day-resume after {last.date()} "
-                    f"new_days={len(score_days)} kept_rows={len(existing_frame)}"
-                )
-                if score_days.empty:
-                    if done_marker is not None:
-                        done_marker.write_text("ok\n", encoding="utf-8")
-                    all_month_frames.append(existing_frame)
-                    continue
-            else:
-                existing_frame = None
+            if existing_frame is not None and "code" in existing_frame.columns:
+                present_codes = set(existing_frame["code"].astype(str).str.upper())
+        missing_codes = [c for c in keep if c not in present_codes]
+        if (
+            resume
+            and existing_frame is not None
+            and done_marker is not None
+            and done_marker.exists()
+            and not missing_codes
+        ):
+            all_month_frames.append(existing_frame)
+            continue
+
+        # Day-level resume: keep prior days, score only later days.
+        # Names added to the universe after that shard was finished are scored
+        # across the whole month and appended.
+        score_days = days
+        if (
+            existing_frame is not None
+            and not existing_frame.empty
+            and "as_of" in existing_frame.columns
+        ):
+            last = pd.to_datetime(existing_frame["as_of"]).max()
+            score_days = days[days > last]
+            print(
+                f"[INFO] month={month} day-resume after {last.date()} "
+                f"new_days={len(score_days)} kept_rows={len(existing_frame)} "
+                f"missing_codes={len(missing_codes)}"
+            )
+        else:
+            existing_frame = None
+        plan = month_backfill_plan(keep, days, score_days, present_codes)
+        if not plan:
+            if done_marker is not None and existing_frame is not None:
+                done_marker.write_text("ok\n", encoding="utf-8")
+            if existing_frame is not None:
+                all_month_frames.append(existing_frame)
+            continue
 
         # eligible codes on first day of month (re-check each day inside loop)
         models: dict[str, FrozenRegimeTransitionModel] = {}
         fit_jobs = []
-        for code in keep:
+        for code in plan:
             series = pd.to_numeric(panel[code], errors="coerce").dropna()
             if series.size < cfg.min_samples + horizon + 5:
                 continue
@@ -956,6 +1009,32 @@ def run_regime_transition_validation(
                     cache_stats["miss"] += 1
                 if model is not None:
                     models[c] = model
+            elig_by_day = _build_elig_by_day(
+                audit,
+                days if missing_codes else score_days,
+                panel,
+                min_history=cfg.min_samples,
+                min_valid_in_20=18,
+            )
+            month_rows: list[dict[str, Any]] = []
+            for code, model in models.items():
+                series = pd.to_numeric(panel[code], errors="coerce").dropna()
+                eligible_days = [d for d in plan.get(code, score_days) if code in elig_by_day[d]]
+                if not eligible_days:
+                    continue
+                month_rows.extend(
+                    run_month_symbol_rows(
+                        code,
+                        series,
+                        pd.DatetimeIndex(eligible_days),
+                        model,
+                        cfg,
+                        horizon=horizon,
+                        kappa_ret=kappa_ret,
+                        kappa_eff=kappa_eff,
+                        kappa_mae=kappa_mae,
+                    )
+                )
         else:
             with ProcessPoolExecutor(max_workers=jobs) as pool:
                 futs = {
@@ -981,33 +1060,39 @@ def run_regime_transition_validation(
                     if model is not None:
                         models[c] = model
 
-        month_rows: list[dict[str, Any]] = []
-        for code, model in models.items():
-            series = pd.to_numeric(panel[code], errors="coerce").dropna()
-            # filter days by eligibility
-            eligible_days = [
-                d
-                for d in score_days
-                if code
-                in eligible_codes_on_date(
-                    audit, d, panel, min_history=cfg.min_samples, min_valid_in_20=18
+                elig_by_day = _build_elig_by_day(
+                    audit,
+                    days if missing_codes else score_days,
+                    panel,
+                    min_history=cfg.min_samples,
+                    min_valid_in_20=18,
                 )
-            ]
-            if not eligible_days:
-                continue
-            month_rows.extend(
-                run_month_symbol_rows(
-                    code,
-                    series,
-                    pd.DatetimeIndex(eligible_days),
-                    model,
-                    cfg,
-                    horizon=horizon,
-                    kappa_ret=kappa_ret,
-                    kappa_eff=kappa_eff,
-                    kappa_mae=kappa_mae,
-                )
-            )
+                month_rows = []
+                score_futs = {}
+                for code, model in models.items():
+                    series = pd.to_numeric(panel[code], errors="coerce").dropna()
+                    eligible_days = [d for d in plan.get(code, score_days) if code in elig_by_day[d]]
+                    if not eligible_days:
+                        continue
+                    elig_strs = [
+                        pd.Timestamp(d).strftime("%Y-%m-%d") for d in eligible_days
+                    ]
+                    score_futs[
+                        pool.submit(
+                            _score_month_symbol,
+                            code,
+                            series,
+                            elig_strs,
+                            model,
+                            cfg,
+                            horizon=horizon,
+                            kappa_ret=kappa_ret,
+                            kappa_eff=kappa_eff,
+                            kappa_mae=kappa_mae,
+                        )
+                    ] = code
+                for fut in as_completed(score_futs):
+                    month_rows.extend(fut.result())
 
         frame = pd.DataFrame(month_rows)
         if existing_frame is not None and not existing_frame.empty:
@@ -1240,6 +1325,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def month_backfill_plan(
+    codes: list[str],
+    days: pd.DatetimeIndex,
+    score_days: pd.DatetimeIndex,
+    present_codes: set[str],
+) -> dict[str, pd.DatetimeIndex]:
+    """Days still to score for each code.
+
+    Codes already in the shard only need days after the shard's last as_of.
+    Codes absent from the shard need the whole month, even when that month
+    was previously marked done.
+    """
+    plan: dict[str, pd.DatetimeIndex] = {}
+    for code in codes:
+        if code not in present_codes:
+            if len(days):
+                plan[code] = days
+        elif len(score_days):
+            plan[code] = score_days
+    return plan
+
+
+def day_already_scored(
+    shard_csv: Path,
+    signals_oos: Path,
+    eval_end: str,
+    codes: list[str] | None = None,
+) -> bool:
+    """True when both files reach eval_end and every requested code is present."""
+    end = pd.Timestamp(eval_end)
+    if pd.isna(end):
+        return False
+    for path in (shard_csv, signals_oos):
+        if not path.is_file():
+            return False
+        try:
+            frame = pd.read_csv(path, usecols=["as_of"])
+        except (ValueError, pd.errors.EmptyDataError, OSError):
+            return False
+        if frame.empty or "as_of" not in frame.columns:
+            return False
+        dates = pd.to_datetime(frame["as_of"], errors="coerce").dropna()
+        if dates.empty or dates.max() < end:
+            return False
+    if codes:
+        try:
+            have = set(
+                pd.read_csv(signals_oos, usecols=["code"])["code"].astype(str).str.upper()
+            )
+        except (ValueError, pd.errors.EmptyDataError, OSError):
+            return False
+        wanted = {str(code).upper() for code in codes}
+        if not wanted.issubset(have):
+            return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     pack_cfg = load_decision_pack_config()
@@ -1253,6 +1395,22 @@ def main(argv: list[str] | None = None) -> int:
     codes = [i.code for i in instruments]
     print(f"[INFO] cluster universe codes={len(codes)} path={cluster_path}")
 
+    resume = not bool(args.no_resume)
+    if resume and args.live_snapshot is None and args.eval_end:
+        out_dir = Path(args.output_dir).expanduser()
+        month = month_key(pd.Timestamp(args.eval_end))
+        if day_already_scored(
+            out_dir / "shards" / f"{month}.signals.csv",
+            out_dir / "signals_oos.csv",
+            args.eval_end,
+            codes,
+        ):
+            print(
+                f"[INFO] regime day already scored through {args.eval_end}; "
+                "skip qlib reload"
+            )
+            return 0
+
     uri = str(args.provider_uri or QLIB_PROVIDER_URI)
     # load enough history before eval_start
     start = (pd.Timestamp(args.eval_start) - pd.tseries.offsets.BDay(400)).strftime(
@@ -1260,7 +1418,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     end = args.eval_end or pd.Timestamp("today").strftime("%Y-%m-%d")
     panel = load_qlib_close(uri, codes, start, end)
-    panel, _ = auto_qfq_adjust_close_panel(panel)
 
     live_meta: dict[str, Any] | None = None
     if args.live_snapshot is not None:

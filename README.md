@@ -2,9 +2,9 @@
 
 [中文](README.zh-CN.md)
 
-Daily A-share commands: pool merge, cluster map, cluster review, regime validation, adaptive HTML, from-listing HTML, HRP dendrogram, and next-day triggers.
+Daily A-share commands: Qlib `cn_data` refresh, pool merge, cluster map, cluster review, regime validation, adaptive HTML, from-listing HTML, HRP dendrogram, and next-day triggers.
 
-Qlib `cn_data` is required and is not downloaded by `pip`. If `pip install` cannot find a package named `qlib`, install Qlib the way this machine already has it, then install this checkout.
+Qlib `cn_data` is required and is not downloaded by `pip`. Refresh it with `ashare-daily cn-data`. If `pip install` cannot find a package named `qlib`, install Qlib the way this machine already has it, then install this checkout.
 
 ## Install
 
@@ -29,33 +29,55 @@ ln -sfn /path/to/regime_transition_model_cache_stock runtime/decision_packs/regi
 
 Run these in order. `adaptive` reads the validation directory written by `regime`. `listing` reads that day's `all_adaptive_stock` directory written by `adaptive`. If that directory is missing, `listing` exits and prints the path. It does not run `adaptive` for you.
 
-Only `listing` writes the HTML under `$PLOTLY_ROOT/20260924_from_listing_stock`. The date comes from `--as-of 2026-09-24`. The other commands write a pool file, cluster tables, a regime signal shard, a different HTML directory, an HRP page, or a trigger table.
+Only `listing` writes the HTML under `$PLOTLY_ROOT/20260924_from_listing_stock`. The date comes from `--as-of 2026-09-24`. `cn-data` replaces the Qlib directory. The later commands write a pool file, cluster tables, a regime signal shard, a different HTML directory, an HRP page, or a trigger table.
 
 ```bash
+ashare-daily cn-data --dest /home/huangtuo/data/qlib_data/cn_data
 ashare-daily pool-merge
-ashare-daily cluster-map
-ashare-daily cluster-review
+ashare-daily screen
+ashare-daily screen-review
 ashare-daily regime --skip-rebuild --skip-html
-ashare-daily adaptive --as-of 2026-09-24
-ashare-daily listing --as-of 2026-09-24
+ashare-daily adaptive --as-of 2026-09-30
+ashare-daily listing --as-of 2026-09-30
 ashare-daily hrp
 ashare-daily hrp --dist-t 0.8
-ashare-daily triggers --listing-dir "$PLOTLY_ROOT/YYYYMMDD_from_listing_stock"
+ashare-daily triggers --listing-dir "$PLOTLY_ROOT/20260930_from_listing_stock"
+ashare-daily rules7 --as-of 2026-09-30
 ```
 
-`listing` is incremental unless you pass `--no-incremental`. EWMA rails on figures 7 through 11, including the 1-month panel, always run after listing HTML. Figure 12 runs unless `--no-fig12`.
+`listing` is incremental unless you pass `--no-incremental`. An incremental patch continues EWMA rails already drawn on the previous HTML. It does not redraw those rails across the directory. Figure 12 runs unless `--no-fig12`.
+
+### `ashare-daily cn-data`
+
+Replaces `~/.qlib/qlib_data/cn_data` with one [chenditc/investment_data](https://github.com/chenditc/investment_data) release. It downloads `qlib_bin.tar.gz` and `qlib_bin.manifest.json` for the same tag, runs upstream `validate_archive.py --require-publishable`, and swaps the directory after that check and the extract both succeed. The previous directory is kept as `cn_data.bak.YYYYMMDD`. When that name already exists, the backup is `cn_data.bak.YYYYMMDD.2`. With no `--tag`, the tag is the GitHub latest release. `--tag 2026-10-04` pins one day. Files this checkout wrote into that directory are created again afterwards. `pool-merge` writes `instruments/csi1800.txt`. `screen` writes `instruments/cluster_mapping_selected.txt`. `cluster-map` overwrites that instruments file when you run it.
 
 ### `ashare-daily pool-merge`
 
 Reads `csi800.txt` and `csi1000.txt` from the Qlib instruments directory in the local json. Keeps each file's latest end date, unions the codes, and writes `csi1800.txt` next to them. This does not draw HTML.
 
+### `ashare-daily screen`
+
+Scores every name in `csi1800.txt` with the same low-correlation / high-return blend `cluster-map` uses (35% low correlation, 65% 252-day cumulative return). Names at or above `0.85` are kept. It writes `$TEMP_DIR/stock_screen_scores.csv` and `$TEMP_DIR/stock_screen_selected.txt`, and copies that instruments file to `instruments/cluster_mapping_selected.txt`. `adaptive` and `listing` read the `$TEMP_DIR` txt. `regime` and `hrp` read the instruments copy. `--score-min` changes the line.
+
+### `ashare-daily screen-review`
+
+Reads `$TEMP_DIR/stock_screen_scores.csv` and trailing closes through `--as-of` (today when omitted). It writes `$TEMP_DIR/stock_screen_review/{YYYYMMDD}/missed_by_score.csv`, `weak_selected.csv`, and `screen_review_{YYYYMMDD}.md`. The first table is unselected names with the strongest 20-day return. The second is selected names with the weakest 20-day return. Windows default to 5, 20, and 60 days.
+
 ### `ashare-daily cluster-map`
 
-Builds the production cluster map from that universe. Defaults are distance `0.60`, 100 names, Sharpe-momentum scoring, and detone off. It writes `cluster_mapping.csv`, `cluster_mapping_selected.csv`, and `cluster_mapping_selected.txt`. The risk step runs only when `paths.etf_risk_report_script` in the local json points at a real file. Output stays under the local json `TEMP_DIR`, not under `PLOTLY_ROOT`.
+Not in the daily order. `screen` writes the list that `adaptive` and `listing` read. This command still builds the old cluster map: distance `0.60`, 100 names, Sharpe-momentum scoring, detone off. It writes `cluster_mapping.csv`, `cluster_mapping_selected.csv`, and `cluster_mapping_selected.txt` under `TEMP_DIR`. The risk step runs only when `paths.etf_risk_report_script` in the local json points at a real file.
+
+Recall auditor (not a subcommand). It does not change the daily pool. `POOL_*` is ignored. The band uses target 100, distance 0.60, a 10-session horizon, and a 0.8 correlation clone. Copy `stock_cluster_mapping_selected.csv` and its metadata JSON to `$TEMP_DIR/stock_cluster_mapping_selected_snapshot.csv` and `$TEMP_DIR/stock_cluster_mapping_selected_metadata_snapshot.json` before the next `cluster-map`, because that command overwrites the live files.
+
+```bash
+python -m ashare_daily.pool.builder.recall_audit --max-anchors 5
+```
+
+The smoke run overwrites `$TEMP_DIR/pool_recall_audit.csv` and `pool_recall_audit_summary.json`. A `band_scope` of `smoke` is not the full decision. The qlib marker stays out of the default test run. Invoke it with `pytest -m recall_qlib -o addopts=`.
 
 ### `ashare-daily cluster-review`
 
-Audits `stock_cluster_mapping_selected.csv` against the full `stock_cluster_mapping.csv` from the same select run. `--future-end` defaults to today. This writes a review under the review output directory. It does not refresh the listing HTML.
+Audits the last `stock_cluster_mapping_selected.csv` against `stock_cluster_mapping.csv`. Those are the old cluster tables, not `stock_screen_scores.csv`. Skipping `cluster-map` leaves them as they were. `--future-end` defaults to today. This writes a review under the review output directory. It does not refresh the screen list or the listing HTML.
 
 ### `ashare-daily regime --skip-rebuild --skip-html`
 
@@ -67,7 +89,7 @@ Draws the adaptive-stage HTML for the 100 cluster-selected names, ending 2026-09
 
 ### `ashare-daily listing --as-of 2026-09-24`
 
-Draws one HTML per name from listing date through 2026-09-24. It first requires both `2026-09.signals.csv` and `$PLOTLY_ROOT/20260924all_adaptive_stock`. If the adaptive directory is missing, it exits and prints that path. HTML goes to `$PLOTLY_ROOT/20260924_from_listing_stock`. Incremental mode appends each missing session after the newest older `*_from_listing_stock` directory under `PLOTLY_ROOT`. After the HTML exists, EWMA rails are added to figures 7 through 11, including the 1-month panel, and figure 12 is added unless `--no-fig12` is set.
+Draws one HTML per name from listing date through 2026-09-24. It first requires both `2026-09.signals.csv` and `$PLOTLY_ROOT/20260924all_adaptive_stock`. If the adaptive directory is missing, it exits and prints that path. HTML goes to `$PLOTLY_ROOT/20260924_from_listing_stock`. Incremental mode appends the next session after the newest older `*_from_listing_stock` directory under `PLOTLY_ROOT`. A gap of more than one session falls back to a full redraw. The patch continues EWMA rails already on that previous HTML. Figure 12 is added unless `--no-fig12` is set.
 
 ### `ashare-daily hrp`
 
@@ -80,6 +102,10 @@ Same dendrogram with a coarser distance cut of `0.8`. The page is `$TEMP_DIR/hrp
 ### `ashare-daily triggers --listing-dir "$PLOTLY_ROOT/YYYYMMDD_from_listing_stock"`
 
 Scans the from-listing HTML and writes next-session trigger prices back into that same directory: `next_day_triggers_{next-day}.md`, `.csv`, and `_hard_touch.csv`. The anchor is `SH000300`. `YYYYMMDD` in the line above is a placeholder. For the 2026-09-24 batch, replace it with `20260924`. If the shell did not expand `$PLOTLY_ROOT`, the command still looks up that directory name under `PLOTLY_ROOT` from `config.env`. When `--as-of` and `--next-day` are omitted, the date in the directory name is T, and T+1 is the next weekday. `20260924_from_listing_stock` becomes `--as-of 2026-09-24 --next-day 2026-09-25`. This skip does not know exchange holidays. Pass `--next-day` yourself when the next session is not the next weekday.
+
+### `ashare-daily rules7 --as-of 2026-09-30`
+
+Writes the figure-9 checklist into `$PLOTLY_ROOT/20260930_from_listing_stock`: `rules7_checklist_{as-of}.csv` and `.md`. Omit `--listing-dir` and the directory is that date's `*_from_listing_stock` folder. Omit both flags and the date is today. The anchor is `SH000300`.
 
 ## Example page
 
