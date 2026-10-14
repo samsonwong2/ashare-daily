@@ -27,7 +27,7 @@ import pandas as pd
 
 from ashare_daily.lib import rules7  # noqa: E402
 from ashare_daily.paths import TEMP_DIR, repo_root  # noqa: E402
-from ashare_daily.plots.add_fig12_six_states import parse_html_label  # noqa: E402
+from ashare_daily.plots.add_fig12_six_states import parse_html_label as _fig12_parse_html_label  # noqa: E402
 
 _PROJECT_ROOT = repo_root()
 
@@ -36,6 +36,25 @@ ACTION_ORDER = {"买": 0, "卖": 1, "持有": 2, "观望": 3}
 NEAR_WARN = 0.03
 CLUSTER_PACK_ROOTS = (TEMP_DIR,)
 CLUSTER_COLS = ("聚类", "簇人数", "是否簇代表", "簇组", "ret20", "推荐买入")
+
+
+def _chinese_name(code: str, label: str) -> str:
+    """Drop a leading ticker so ``SZ300677 英科医疗`` stays ``英科医疗``."""
+    text = str(label or "").strip()
+    prefix = f"{str(code or '').strip()} "
+    if prefix.strip() and text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
+
+def parse_html_label(path: Path) -> tuple[str, str]:
+    """Return ``(code, Chinese name)`` from a regime_transition filename.
+
+    Fig12's parser returns ``CODE 中文名`` for chart titles. Checklist tables
+    already have a code column, so the name column is the Chinese name only.
+    """
+    code, label = _fig12_parse_html_label(path)
+    return code, _chinese_name(code, label)
 
 
 def _f(v: Any) -> float | None:
@@ -143,7 +162,7 @@ THRESHOLDS = [
     ("G1", "图7、图8 斜率 > 0，图9位置 10 日升 ≥ 30pp 且 ≥ 80%，未触图9上轨，图10斜率 > 图9斜率",
      "持仓中触发后本笔不再按图9/图8 卖"),
     ("回落触发", "收盘 ≤ 持仓最高收盘 × (1 − 回落幅度)", "卖（规则设回落时）"),
-    ("买点价", "收盘 ≤ 图9下轨 × 1.01", "空仓行的买点价列，不是新的成交规则"),
+    ("买点价", "收盘 ≤ 图9下轨 × 1.01", "每只都填；持仓行不产生新买单"),
 ]
 
 
@@ -334,15 +353,11 @@ def scan_one(html: Path, *, listing: Path, as_of: pd.Timestamp, anchor_code: str
         "买入信号": _yn(snap["buy_signal"]),
         "卖出信号": _yn(snap["sell_signal"]),
     }
-    if st["holding"]:
-        row["买点价"] = ""
-        row["买点状态"] = ""
-    else:
-        quote, quote_status = rules7.flat_buy_quote(
-            snap, spec, applicable=code.upper() not in rules7.NOT_APPLICABLE,
-        )
-        row["买点价"] = "" if quote is None else _px(quote)
-        row["买点状态"] = quote_status
+    quote, quote_status = rules7.flat_buy_quote(
+        snap, spec, applicable=code.upper() not in rules7.NOT_APPLICABLE,
+    )
+    row["买点价"] = "" if quote is None else _px(quote)
+    row["买点状态"] = quote_status
     row["_html"] = html.name
     row.update({col: fmt(snap) for col, fmt in SNAP_COLS})
     row.update({
@@ -397,23 +412,71 @@ def _gap_to_buy(px_cell: Any, buy_cell: Any) -> float:
     return px / buy - 1.0
 
 
-def _format_flat_buy_section(flat: pd.DataFrame, listing: Path) -> list[str]:
-    n_buy = int(flat["今日动作"].astype(str).eq("买").sum()) if "今日动作" in flat.columns else 0
+def _cell_yes(value: Any) -> bool:
+    return str(value or "").strip() == "是"
+
+
+def _filled_cell(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"", "nan", "none"}:
+        return ""
+    return text
+
+
+def _quote_from_public_row(row: pd.Series) -> tuple[str, str]:
+    """Keep a stored quote, or rebuild it from the public indicator columns."""
+    price = _filled_cell(row.get("买点价"))
+    status = _filled_cell(row.get("买点状态"))
+    if price and status:
+        return price, status
+    lo = _f(row.get("图9下轨"))
+    if lo is None:
+        return price, status or "无下轨"
+    if not price:
+        price = f"{lo * (1.0 + rules7.DEFAULT_NEAR_PCT):.4f}"
+    if status:
+        return price, status
+    rule = str(row.get("买规则") or "")
+    if "规则不适用" in str(row.get("类型") or ""):
+        return price, "规则不适用"
+    if "快形态不买" in rule and _cell_yes(row.get("快形态(≥20%)")):
+        return price, "快形态挡住"
+    if _cell_yes(row.get("买入信号")):
+        return price, "今天已是买点"
+    near = _cell_yes(row.get("图9近下轨(≤下轨×1.01)"))
+    if "B1" in rule and _cell_yes(row.get("图7或图8折价≤-8%")) and not near:
+        return price, "贴轨即可"
+    if not _cell_yes(row.get("辅助买像")):
+        return price, "辅助买像未齐"
+    if near:
+        return price, "已在带内，明天同价不算"
+    return price, "还差这个价"
+
+
+def _backfill_buy_quotes(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    filled = [_quote_from_public_row(row) for _, row in out.iterrows()]
+    out["买点价"] = [price for price, _status in filled]
+    out["买点状态"] = [status for _price, status in filled]
+    return out
+
+
+def _format_flat_buy_section(frame: pd.DataFrame, listing: Path) -> list[str]:
+    n_buy = int(frame["今日动作"].astype(str).eq("买").sum()) if "今日动作" in frame.columns else 0
     lines = [
         "## 空仓买点价",
         "",
         f"今天买入信号 **{n_buy}** 只。买入信号为 0 则今天不买。",
-        "买点价 = 图9下轨 × 1.01，只对空仓行填写，不是盘中委托。成交仍是信号出现之后的下一根收盘。",
+        "买点价 = 图9下轨 × 1.01，持仓和空仓都填。持仓行的这个价格不产生新的买单。",
+        "不是盘中委托。成交仍是信号出现之后的下一根收盘，且只在当时空仓时成交。",
         "已在带内的下一根收盘若仍在带内，不是新的 aux_edge。",
         "",
     ]
-    if flat.empty:
+    if frame.empty:
         return lines + ["（无）", ""]
-    show = flat.copy()
-    if "买点价" not in show.columns:
-        show["买点价"] = ""
-    if "买点状态" not in show.columns:
-        show["买点状态"] = ""
+    show = _backfill_buy_quotes(frame)
     show["_gap"] = [_gap_to_buy(px, buy) for px, buy in zip(show["T收盘"], show["买点价"])]
     show = show.sort_values("_gap", kind="mergesort")
     links = []
@@ -422,7 +485,10 @@ def _format_flat_buy_section(flat: pd.DataFrame, listing: Path) -> list[str]:
         links.append(f"[{r['代码']}]({html_name})" if html_name else str(r["代码"]))
     show = show.copy()
     show["代码"] = links
-    lines += _md_table(show, ["代码", "名称", "买点价", "买点状态", "T收盘", "图9下轨", "距图9下轨"])
+    lines += _md_table(
+        show,
+        ["代码", "名称", "类型", "今日状态", "买点价", "买点状态", "T收盘", "图9下轨", "距图9下轨"],
+    )
     return lines
 
 
@@ -475,8 +541,7 @@ def write_markdown(path: Path, df: pd.DataFrame, *, as_of: pd.Timestamp, listing
     lines += _md_table(hold, ["代码", "名称", "聚类", "是否簇代表", "类型", "今日动作", "买入日", "买入价",
                               "T收盘", "持仓浮盈", "回落止损价", "距止损", "本笔G1已触发", "卖点被G1屏蔽", "触发指标"])
 
-    flat = df[~df["_holding"]].copy()
-    lines += _format_flat_buy_section(flat, listing)
+    lines += _format_flat_buy_section(df, listing)
     near_stop = holding[holding["_dist_stop"] <= NEAR_WARN].sort_values("_dist_stop") if "_dist_stop" in holding.columns else holding.iloc[0:0]
     lines += [f"## 接近触发（{NEAR_WARN:.0%} 以内）", "",
               f"### 持仓、距回落止损 ≤ {NEAR_WARN:.0%}：{len(near_stop)} 只", ""]
@@ -496,7 +561,7 @@ def write_markdown(path: Path, df: pd.DataFrame, *, as_of: pd.Timestamp, listing
         "## 注意",
         "",
         "- 今日动作看的是该标的所用规则：买入信号只在空仓时生效，卖出信号只在持仓且本笔未触发 G1 时生效（G1 后不卖的规则）。",
-        "- 买点价 = 图9下轨 × 1.01，只对空仓行填写。不是盘中委托。成交仍是信号日之后的下一根收盘。",
+        "- 买点价 = 图9下轨 × 1.01，持仓和空仓都填。持仓行不产生新的买单。不是盘中委托。成交仍是信号日之后的下一根收盘，且只在当时空仓时成交。",
         "- 已在带内的下一根收盘若仍在带内，不是新的 aux_edge。",
         "- **推荐买入**：同一 HRP 簇内若多只同时出现买入信号，只标一只（优先簇代表，其次 |ret20| 更大，再次更贴近图9下轨）。未进聚类的买入信号各自保留。",
         "- 恒生医药 SZ159892 在文档里没有一套规则能真正赚钱，标为“规则不适用”，信号仅供参考。",
@@ -537,7 +602,7 @@ def _format_hrp_cluster_section(df: pd.DataFrame, *, cluster_path: Path | None) 
             rep_txt = f"{r0['代码']} {r0['名称']}"
             ret_txt = r0.get("ret20") or "—"
         members = "、".join(
-            f"{r['代码']}{r['名称']}({r['今日状态']}/{r['今日动作']})"
+            f"{r['代码']} {r['名称']}({r['今日状态']}/{r['今日动作']})"
             for _, r in sub.sort_values("代码").iterrows()
         )
         buy_codes = "、".join(sub.loc[sub["今日动作"] == "买", "代码"].astype(str))
@@ -568,6 +633,11 @@ def _ensure_helper_cols(df: pd.DataFrame) -> pd.DataFrame:
     )
     if "_type" not in out.columns:
         out["_type"] = out["类型"].astype(str).str.replace("（规则不适用）", "", regex=False)
+    if "代码" in out.columns and "名称" in out.columns:
+        out["名称"] = [
+            _chinese_name(str(code), str(name))
+            for code, name in zip(out["代码"], out["名称"])
+        ]
     out["_dist_lo9"] = out["距图9下轨"].map(_parse_pct_cell)
     out["_dist_lo9"] = out["_dist_lo9"].map(lambda x: np.nan if x is None else x / 100.0)
     out["_dist_stop"] = out["距止损"].map(_parse_pct_cell)
@@ -579,7 +649,7 @@ def _ensure_helper_cols(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = out["触发指标"].fillna("").astype(str).map(
                 lambda s, lab=label: lab in {x.strip() for x in s.split("；")}
             )
-    return out
+    return _backfill_buy_quotes(out)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -350,8 +350,8 @@ def indicator_snapshot(frame: pd.DataFrame, masks: dict[str, pd.Series], spec: R
 def flat_buy_quote(snap: dict[str, Any], spec: RuleSpec, *, applicable: bool = True) -> tuple[float | None, str]:
     """Price that counts as touching fig9's lower rail, plus why it is or isn't a buy.
 
-    Holding rows must not call this. The price is ``fig9_lower × (1 + near)`` for
-    this close only. It is not an intraday order.
+    The price is ``fig9_lower × (1 + near)`` for this close only. It is not an
+    intraday order. A holding row may show the same price; it does not open a new buy.
     """
     try:
         price = float(snap.get("lo9")) * (1.0 + DEFAULT_NEAR_PCT)
