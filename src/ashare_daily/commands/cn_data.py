@@ -18,7 +18,10 @@ def _release_tag(value: str) -> str:
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(
         prog="ashare-daily cn-data",
-        description="Replace Qlib cn_data from one chenditc/investment_data release.",
+        description=(
+            "Replace Qlib cn_data from one chenditc/investment_data release. "
+            "Uses http://127.0.0.1:31181 when that proxy accepts connections."
+        ),
     )
     command.add_argument(
         "--tag",
