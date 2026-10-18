@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import List
 
@@ -310,6 +311,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Never compare to stock_cluster_mapping_selected_YYYYMMDD.csv (quality-only mode)",
     )
     return parser
+
+
+def missing_review_inputs_message(paths: list[Path]) -> str:
+    listed = ", ".join(str(path) for path in paths)
+    return (
+        f"Cluster review input not found: {listed}. "
+        "Cause: this command reads the tables left by cluster-map. "
+        "Fix: run ashare-daily cluster-map, or pass --selected-csv and --mapping-csv."
+    )
+
+
+def ensure_review_inputs(selected_csv: str, mapping_csv: str) -> None:
+    missing: list[Path] = []
+    for raw in (selected_csv, mapping_csv):
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            missing.append(path)
+    if missing:
+        raise FileNotFoundError(missing_review_inputs_message(missing))
 
 
 def load_hand_selected_codes(path: str) -> list[str]:
@@ -802,6 +822,7 @@ def run_daily_review(args: argparse.Namespace) -> int:
     review_date = pd.Timestamp(args.future_end).strftime("%Y-%m-%d")
     date_tag = pd.Timestamp(args.future_end).strftime("%Y%m%d")
 
+    ensure_review_inputs(args.selected_csv, args.mapping_csv)
     out_dir = args.out_dir or os.path.join(DEFAULT_OUT_BASE, f"daily_{date_tag}")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -910,7 +931,11 @@ def run_daily_review(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return run_daily_review(args)
+    try:
+        return run_daily_review(args)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

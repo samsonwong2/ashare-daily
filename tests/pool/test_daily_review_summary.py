@@ -5,12 +5,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 from ashare_daily.pool.builder import audit
 from ashare_daily.pool.builder.daily_review import (
     build_missed_clusters,
     build_rep_lag,
+    ensure_review_inputs,
+    missing_review_inputs_message,
     overlay_hand_selected,
 )
 
@@ -66,6 +69,16 @@ def test_build_cluster_quality_summary_columns():
     assert bool(row1["has_selected_rep"]) is True
     row2 = summary[summary["cluster"] == 2].iloc[0]
     assert int(row2["cluster_cut_flag"]) == 1
+
+
+def test_missing_review_inputs_names_cluster_map(tmp_path: Path):
+    selected = tmp_path / "stock_cluster_mapping_selected.csv"
+    mapping = tmp_path / "stock_cluster_mapping.csv"
+    message = missing_review_inputs_message([selected, mapping])
+    assert str(selected) in message
+    assert "cluster-map" in message
+    with pytest.raises(FileNotFoundError, match="cluster-map"):
+        ensure_review_inputs(str(selected), str(mapping))
 
 
 def test_overlay_hand_selected_marks_selection_source():
